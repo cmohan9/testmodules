@@ -290,7 +290,11 @@ function Write-Log {
     # below) so the whole run's log can be uploaded as one blob to the Logs
     # container -- including on failure, via the try/finally around the run.
     Write-Host $line
-    if ($LogLines) { $LogLines.Add($line) }
+    # Explicit null check, NOT `if ($LogLines)` -- an empty List[string] evaluates
+    # to $false in a boolean context in PowerShell, which would make this check
+    # permanently false for a list that starts empty (it can never become
+    # non-empty if .Add() is gated behind its own emptiness).
+    if ($null -ne $LogLines) { $LogLines.Add($line) }
 }
 
 # ── Auth (with auto-refresh). One token is used for BOTH Privilege Cloud and SCA
@@ -434,7 +438,11 @@ function Send-BlobText {
     param(
         [Parameter(Mandatory)][string]$Container,
         [Parameter(Mandatory)][string]$BlobPath,
-        [Parameter(Mandatory)][string]$Content,
+        # AllowEmptyString: a Mandatory [string] parameter otherwise REJECTS ""
+        # outright ("Cannot bind argument... because it is an empty string") --
+        # a genuinely empty blob (e.g. a log with zero captured lines) is a
+        # valid case, not a caller error.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
         [string]$ContentType = "text/csv; charset=utf-8"
     )
     $bytes = [Text.Encoding]::UTF8.GetBytes($Content)
