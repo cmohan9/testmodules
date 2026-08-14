@@ -256,9 +256,14 @@ $ScaBase     = "https://$ScaSubdomain.sca.cyberark.cloud/api"
 # setting), NOT the Function App's own AzureWebJobsStorage. Container names
 # are overridable via LATEST_CONTAINER/ARCHIVE_CONTAINER/LOGS_CONTAINER in
 # case you ever want output to land somewhere other than the defaults below.
-$LatestContainer  = if ([string]::IsNullOrWhiteSpace($env:LATEST_CONTAINER))  { "Latest"  } else { $env:LATEST_CONTAINER }
-$ArchiveContainer = if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_CONTAINER)) { "Archive" } else { $env:ARCHIVE_CONTAINER }
-$LogsContainer    = if ([string]::IsNullOrWhiteSpace($env:LOGS_CONTAINER))   { "Logs"    } else { $env:LOGS_CONTAINER }
+# Azure Blob Storage container names MUST be lowercase (a hard platform rule --
+# 3-63 chars, lowercase letters/numbers/hyphens only), so these defaults are
+# lowercase even though the Portal UI may display them with a capital first
+# letter. If you set LATEST_CONTAINER/ARCHIVE_CONTAINER/LOGS_CONTAINER
+# yourself, use the exact (lowercase) name Azure actually stored.
+$LatestContainer  = if ([string]::IsNullOrWhiteSpace($env:LATEST_CONTAINER))  { "latest"  } else { $env:LATEST_CONTAINER }
+$ArchiveContainer = if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_CONTAINER)) { "archive" } else { $env:ARCHIVE_CONTAINER }
+$LogsContainer    = if ([string]::IsNullOrWhiteSpace($env:LOGS_CONTAINER))   { "logs"    } else { $env:LOGS_CONTAINER }
 $RunTimestamp      = Get-Date -Format "yyyyMMdd_HHmmss"
 $ArchivePathPrefix = $RunTimestamp   # blob-name prefix within the Archive container -- its own "folder" per run
 
@@ -486,6 +491,49 @@ function Send-BlobText {
     }
 }
 
+# Creates a container if it doesn't already exist (idempotent -- a 409
+# "already exists" response is treated as success, not an error). Called once
+# per container during INITIALISE so a deleted/mistyped container name fails
+# fast with a clear message instead of every subsequent blob write 404'ing.
+function New-BlobContainerIfMissing {
+    param([Parameter(Mandatory)][string]$Container)
+
+    $apiVersion = "2021-08-06"
+    $dateRfc1123 = [DateTime]::UtcNow.ToString("R")
+    $headers = @{ "x-ms-date" = $dateRfc1123; "x-ms-version" = $apiVersion }
+    $canonicalizedHeaders  = New-BlobCanonicalizedHeaders -Headers $headers
+    $canonicalizedResource = "/$($StorageContext.AccountName)/$Container`nrestype:container"
+
+    $stringToSign = (@(
+        "PUT", "", "", "", "", "", "", "", "", "", "", ""
+    ) -join "`n") + "`n$canonicalizedHeaders$canonicalizedResource"
+
+    $keyBytes = [Convert]::FromBase64String($StorageContext.AccountKey)
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    $hmac.Key = $keyBytes
+    $sigBytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))
+    $signature = [Convert]::ToBase64String($sigBytes)
+
+    $reqHeaders = @{
+        "x-ms-date"     = $dateRfc1123
+        "x-ms-version"  = $apiVersion
+        "Authorization" = "SharedKey $($StorageContext.AccountName):$signature"
+    }
+    $uri = "https://$($StorageContext.AccountName).blob.core.windows.net/${Container}?restype=container"
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method PUT -Headers $reqHeaders -ErrorAction Stop | Out-Null
+        Write-Log "Container '$Container' did not exist -- created it." WARN
+    } catch {
+        $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($s -eq 409) {
+            # Already exists -- expected on every run after the first, not an error.
+            return
+        }
+        throw "Failed to ensure container '$Container' exists (HTTP $s): $($_.Exception.Message)"
+    }
+}
+
 
 # ==============================================================================
 # MODULE 3 : CLASSIFICATION & NAMING-CONVENTION FUNCTIONS
@@ -637,6 +685,13 @@ function Test-AccountAddress { param([string]$a)
 # very thing that would upload it needs this context) -- that one failure mode
 # is only visible in Application Insights, not the Logs container.
 $StorageContext  = Get-StorageAccountContext
+
+# Ensure all three containers exist before anything else runs -- self-heals a
+# deleted/never-created container, and fails fast with a clear message rather
+# than every subsequent blob write 404'ing partway through the run.
+foreach ($c in @($LatestContainer, $ArchiveContainer, $LogsContainer)) {
+    New-BlobContainerIfMissing -Container $c
+}
 
 # Accumulates every Write-Log line so the whole run's log can be uploaded as
 # ONE blob to the Logs container at the end -- inside a try/finally so this
