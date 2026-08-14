@@ -1159,7 +1159,17 @@ Write-Log "=== CyberArk Dashboard Complete ===" SECTION
         $logText = ($LogLines -join "`r`n")
         Send-BlobText -Container $LogsContainer -BlobPath "$RunTimestamp.log" -Content $logText -ContentType "text/plain; charset=utf-8"
     } catch {
-        Write-Host "Failed to upload log blob to '$LogsContainer/$RunTimestamp.log': $($_.Exception.Message)"
+        $uploadErrMsg = "Failed to upload log blob to '$LogsContainer/$RunTimestamp.log': $($_.Exception.Message)"
+        Write-Host $uploadErrMsg
+        # Fallback so this is visible WITHOUT Application Insights access: write
+        # the caught error itself into the Latest container, which by this point
+        # in the run has already proven to accept writes successfully.
+        try {
+            Send-BlobText -Container $LatestContainer -BlobPath "_LastLogUploadError.txt" -Content $uploadErrMsg -ContentType "text/plain; charset=utf-8"
+        } catch {
+            # Nothing more we can do to surface this -- both the intended log
+            # write and this fallback failed. Falls through to Write-Host only.
+        }
     }
 }
 
