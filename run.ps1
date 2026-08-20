@@ -1,89 +1,42 @@
 <#
 .SYNOPSIS
     CyberArk Power BI Dashboard Data Exporter — Privilege Cloud + Secure Cloud
-    Access (SCA) — Azure Functions (Flex Consumption) Timer Trigger version.
+    Access (SCA)
 .DESCRIPTION
-    READ-ONLY script that authenticates once to CyberArk and exports both the
-    Privilege Cloud (PAM) data and the Secure Cloud Access (SCA) data as CSVs
-    into Azure Blob Storage, replacing the on-prem scheduled-task version
-    (PAM_SCA_Dashboard_Final.ps1) which wrote to local Latest\/Archive\ folders.
+    READ-ONLY script that authenticates once to CyberArk and exports
+    both the Privilege Cloud (PAM) data and the Secure Cloud Access (SCA) data — into Latest\ folder.
 
-    MODULES (same organization as the on-prem script):
-      MODULE 1 — Configuration            (Sections A-J, unchanged business rules;
-                                            Section A credentials now read from
-                                            environment variables/App Settings)
-      MODULE 2 — Shared helpers           (logging, auth, HTTP retry wrappers,
-                                            + Blob Storage REST helper — new)
-      MODULE 3 — Classification functions (region/tier/safe-type/team-tag parsing
-                                            — byte-for-byte unchanged, pure functions)
-      MODULE 4 — PAM data collection      (Privilege Cloud: Safes/Users/Accounts/
-                                            Vault/Onboarding — unchanged logic)
-      MODULE 5 — SCA data collection      (Secure Cloud Access: Policies —
-                                            unchanged logic)
-      MODULE 6 — CSV export               (writes to Blob Storage instead of a
-                                            local folder; same column schemas)
-      MODULE 7 — Run summary               (console/App Insights report + run
-                                            metadata JSON, written to Blob Storage)
+    The script is organized into labeled MODULES
+      MODULE 1 — Configuration           (Sections A-J)
+      MODULE 2 — Shared helpers          (logging, auth, HTTP retry wrappers)
+      MODULE 3 — Classification functions (region/tier/safe-type/team-tag parsing)
+      MODULE 4 — PAM data collection      (Privilege Cloud: Safes/Users/Accounts/Vault/Onboarding)
+      MODULE 5 — SCA data collection      (Secure Cloud Access: Policies)
+      MODULE 6 — CSV export               (writes everything to Latest\)
+      MODULE 7 — Run summary              (console report + run metadata JSON)
 
-    WHAT CHANGED FROM THE ON-PREM SCRIPT (everything else is identical):
-      - Section A credentials come from environment variables (Application
-        Settings in the Function App), not hardcoded values.
-      - All local file I/O (Export-Csv/Set-Content/Out-File to Latest\/Archive\,
-        plus the local log file) is replaced with raw calls to the Azure Blob
-        Storage REST API, signed with Shared Key (HMAC-SHA256) using only
-        built-in .NET crypto (System.Security.Cryptography) — no Az.Storage or
-        any other external module, since Flex Consumption does not support
-        managed dependencies.
-      - Output goes to a SEPARATE storage account (its connection string in
-        the PamDataStorage app setting — distinct from the Function App's own
-        AzureWebJobsStorage, which is only used for the platform's internal
-        bookkeeping) with three top-level containers standing in for the old
-        folder structure: "Latest" (current CSVs + run metadata, the Power BI
-        source), "Archive" (one "<RunTimestamp>/" blob-name prefix per run,
-        i.e. one "folder" per historical run), and "Logs" (one log blob per
-        run, named "<RunTimestamp>.log").
-      - Write-Log still writes via Write-Host (captured by Application
-        Insights automatically) AND accumulates every line into $LogLines,
-        uploaded as one blob to the Logs container at the end of the run —
-        inside a try/finally so this still happens even if the run fails
-        partway through.
-      - Get-AuthToken now `throw`s instead of `exit 1` on failure to
-        authenticate — inside an Azure Functions PowerShell worker, `exit`
-        would kill the whole worker process; `throw` correctly fails just
-        this invocation so the platform logs/retries it properly.
-.MODE
-    READ-ONLY (GET requests only to CyberArk; only Blob Storage PUT calls write
-    data, and only to your own storage account — no changes are made to CyberArk)
+    Output Structure:
+      Latest\   — Power BI data source (fixed filenames, overwritten each run)
+      Archive\  — Historical snapshots (timestamped subfolders)
 .NOTES
     Author   : Mohan C
-    Requires : Azure Functions PowerShell 7.4 worker, Flex Consumption plan
+    Requires : PowerShell 5.1+
                A CyberArk service account with:
                  - Privilege Cloud Administrator or Auditor role (for the PAM module)
                  - The SCA API role granted in Identity Administration
 #>
 
-param($Timer)
-
-if ($Timer -and $Timer.IsPastDue) {
-    Write-Host "Timer is running late — a previous invocation may have overrun the schedule." -ForegroundColor Yellow
-}
 
 #=========================================================================
 # MODULE 1 : CONFIGURATION
 #=========================================================================
 
-# ── Section A: Credentials (from environment variables / App Settings) ──────
-$IdentityTenantId  = $env:IDENTITY_TENANT_ID
-$ServiceUserId     = $env:SERVICE_USER_ID
-$ServiceUserSecret = $env:SERVICE_USER_SECRET
-$Subdomain         = $env:SUBDOMAIN
-$ScaSubdomain      = $env:SCA_SUBDOMAIN
-
-foreach ($required in @("IDENTITY_TENANT_ID","SERVICE_USER_ID","SERVICE_USER_SECRET","SUBDOMAIN","SCA_SUBDOMAIN")) {
-    if ([string]::IsNullOrWhiteSpace((Get-Item "env:$required" -ErrorAction SilentlyContinue).Value)) {
-        throw "Required app setting '$required' is missing or empty. Configure it in the Function App's Environment Variables."
-    }
-}
+# ── Section A: Credentials ──────────────────────────────────────────────
+$IdentityTenantId  = "XXXXXXXXXXXXXXX"
+$ServiceUserId     = "XXXXXXXXXXXXX"
+$ServiceUserSecret = "XXXXXXXXXXXXXXXXXXXXXX"
+$Subdomain         = "XXXXXXXXX"
+$ScaSubdomain      = "XXXXXXXX"
 
 # ── Section B: Thresholds & Windows ──────────────────────────────────────────
 $LoginWindowDays      = 30     # Users considered "active" if logged in within N days
@@ -158,6 +111,11 @@ $TierRegex = '(^|[-_ ])T([012])([-_ ]|$)'   # Captures T0/T1/T2 from the safe na
 $PersonalAdminSuffixRegex = '-ADM$'
 $SharedAdminSuffixRegex   = '-T[012]$'
 $PersonalAdminTierLabel   = 'Personal/All-Tiers'   # used when no T0/T1/T2 token is present
+# Personal Admin safes carry no tier in their own NAME -- but the accounts inside
+# them often have a PlatformID that DOES end in a tier suffix (e.g. "...-T1").
+# When present, that becomes the safe's (and its accounts') real Tier instead of
+# the placeholder above -- see the correction pass in Module 4.3.
+$PersonalAdminPlatformTierRegex = '-T([012])$'
 
 # Safe name validation: business safe names SHOULD match this regex. Auto-builds
 # from $RegionPrefixes keys if left empty; -ADM/-T0/-T1/-T2 admin safes are ALSO
@@ -206,7 +164,7 @@ $TeamCodeMap = [ordered]@{
     "EPS"="Endpoint Security"; "CTX"="Citrix"; "SIEM"="SIEM"; "MDW"="Middleware"
     "SAP"="SAP"; "TLS"="Tools"; "CMDB"="CMDB"; "VAPT"="Vulnerability & Pen Testing"
     "NSG"="Network Security Group"; "VDI"="VDI"; "CLD"="Cloud"; "MSG"="Messaging"
-
+   
 }
 # Trailing suffix => this safe holds a Cyberark Specific account type, checked
 $SafePurposeSuffixes = [ordered]@{
@@ -246,26 +204,18 @@ $CloudProviderMap = @{
 
 
 # ==============================================================================
-# URLS & STORAGE TARGETS
+# URLS & PATHS
 # ==============================================================================
 $IdentityUrl = "https://$IdentityTenantId.id.cyberark.cloud"
 $PvwaBase    = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault/API"
 $ScaBase     = "https://$ScaSubdomain.sca.cyberark.cloud/api"
 
-# Blob Storage output target -- a separate storage account (PamDataStorage app
-# setting), NOT the Function App's own AzureWebJobsStorage. Container names
-# are overridable via LATEST_CONTAINER/ARCHIVE_CONTAINER/LOGS_CONTAINER in
-# case you ever want output to land somewhere other than the defaults below.
-# Azure Blob Storage container names MUST be lowercase (a hard platform rule --
-# 3-63 chars, lowercase letters/numbers/hyphens only), so these defaults are
-# lowercase even though the Portal UI may display them with a capital first
-# letter. If you set LATEST_CONTAINER/ARCHIVE_CONTAINER/LOGS_CONTAINER
-# yourself, use the exact (lowercase) name Azure actually stored.
-$LatestContainer  = if ([string]::IsNullOrWhiteSpace($env:LATEST_CONTAINER))  { "latest"  } else { $env:LATEST_CONTAINER }
-$ArchiveContainer = if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_CONTAINER)) { "archive" } else { $env:ARCHIVE_CONTAINER }
-$LogsContainer    = if ([string]::IsNullOrWhiteSpace($env:LOGS_CONTAINER))   { "logs"    } else { $env:LOGS_CONTAINER }
-$RunTimestamp      = Get-Date -Format "yyyyMMdd_HHmmss"
-$ArchivePathPrefix = $RunTimestamp   # blob-name prefix within the Archive container -- its own "folder" per run
+$ScriptRoot   = $PSScriptRoot
+$LatestDir    = "$ScriptRoot\Latest"
+$ArchiveRoot  = "$ScriptRoot\Archive"
+$RunTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$ArchiveDir   = "$ArchiveRoot\$RunTimestamp"
+$LogFile      = "$LatestDir\DashboardExport.log"
 
 if ([string]::IsNullOrWhiteSpace($SafeNameExpectedRegex)) {
     $prefixAlts = ($RegionPrefixes.Keys | ForEach-Object { [regex]::Escape($_) }) -join '|'
@@ -276,25 +226,17 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 
 
 # ==============================================================================
-# MODULE 2 : HELPERS
-# Logging, authentication (ONE token, reused for both PAM and SCA calls),
-# and Blob Storage REST helper (replaces local file I/O).
+# MODULE 2 : HELPERS            
+# Logging, authentication (ONE token, reused for both PAM and SCA calls)
 # ==============================================================================
 
 function Write-Log {
     param([string]$Message,
           [ValidateSet("INFO","WARN","ERROR","SUCCESS","DEBUG","SECTION")][string]$Level="INFO")
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$Level,$Message
-    # Write-Host is captured by Application Insights / the Functions log stream
-    # automatically. Also accumulated into $LogLines (initialized in INITIALISE,
-    # below) so the whole run's log can be uploaded as one blob to the Logs
-    # container -- including on failure, via the try/finally around the run.
-    Write-Host $line
-    # Explicit null check, NOT `if ($LogLines)` -- an empty List[string] evaluates
-    # to $false in a boolean context in PowerShell, which would make this check
-    # permanently false for a list that starts empty (it can never become
-    # non-empty if .Add() is gated behind its own emptiness).
-    if ($null -ne $LogLines) { $LogLines.Add($line) }
+    Add-Content -Path $LogFile -Value $line
+    $c = @{INFO="Cyan";WARN="Yellow";ERROR="Red";SUCCESS="Green";DEBUG="DarkGray";SECTION="Magenta"}[$Level]
+    Write-Host $line -ForegroundColor $c
 }
 
 # ── Auth (with auto-refresh). One token is used for BOTH Privilege Cloud and SCA
@@ -312,10 +254,8 @@ function Get-AuthToken {
         Write-Log "Token acquired (valid ~${exp}s)." SUCCESS
     } catch {
         Write-Log "Authentication FAILED: $($_.Exception.Message)" ERROR
-        # `throw` (not `exit`) -- exiting would kill the whole Functions worker
-        # process; throwing fails just this invocation so the platform logs
-        # and (per its retry policy) can retry it on the next schedule.
-        throw "Cannot continue without a valid CyberArk token: $($_.Exception.Message)"
+        Write-Log "Cannot continue without a valid token. Exiting." ERROR
+        exit 1
     }
 }
 function Get-Headers {
@@ -398,150 +338,6 @@ function Safe-DateString { param($v, [string]$Default = "")
     return Safe-String $v $Default
 }
 
-# ── Blob Storage (raw REST, Shared Key auth -- no Az.Storage module) ─────────
-# Flex Consumption doesn't support managed dependencies, so this signs requests
-# to the Azure Storage REST API itself using only built-in .NET crypto
-# (System.Security.Cryptography.HMACSHA256). This is the same Shared Key
-# signing algorithm the Az.Storage module would use internally -- just done
-# by hand so no external module needs to be installed.
-function Get-StorageAccountContext {
-    # PamDataStorage is a SEPARATE storage account from AzureWebJobsStorage
-    # (which the Function App still uses internally for its own bookkeeping) --
-    # output goes to its own dedicated account/containers instead of sharing
-    # the app's runtime storage. Expects the full connection string (as copied
-    # from the storage account's Access keys -> Connection string field).
-    $connStr = $env:PamDataStorage
-    if ([string]::IsNullOrWhiteSpace($connStr)) {
-        throw "PamDataStorage app setting is not configured -- cannot write output."
-    }
-    $parts = @{}
-    foreach ($seg in $connStr -split ';') {
-        if ($seg -match '^([^=]+)=(.*)$') { $parts[$matches[1]] = $matches[2] }
-    }
-    if (-not $parts.ContainsKey('AccountName') -or -not $parts.ContainsKey('AccountKey')) {
-        throw "PamDataStorage connection string is missing AccountName/AccountKey (unexpected format)."
-    }
-    return [pscustomobject]@{ AccountName = $parts['AccountName']; AccountKey = $parts['AccountKey'] }
-}
-
-function New-BlobCanonicalizedHeaders {
-    param([hashtable]$Headers)
-    # Spec requires lower-cased header names, sorted lexicographically.
-    ($Headers.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name.ToLowerInvariant()):$($_.Value)`n" }) -join ''
-}
-
-# Uploads (overwrites) one blob as UTF-8 text via the Blob Storage "Put Blob"
-# REST operation. $BlobPath is the blob name including any "/" prefixes, e.g.
-# "Latest/DIM_Region.csv" or "Archive/20260813_050000/DIM_Region.csv" -- Blob
-# Storage has no real folders, "/" in a blob name just displays like one.
-function Send-BlobText {
-    param(
-        [Parameter(Mandatory)][string]$Container,
-        [Parameter(Mandatory)][string]$BlobPath,
-        # AllowEmptyString: a Mandatory [string] parameter otherwise REJECTS ""
-        # outright ("Cannot bind argument... because it is an empty string") --
-        # a genuinely empty blob (e.g. a log with zero captured lines) is a
-        # valid case, not a caller error.
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
-        [string]$ContentType = "text/csv; charset=utf-8"
-    )
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Content)
-    $contentLength = $bytes.Length
-    $apiVersion = "2021-08-06"
-
-    $a = 0
-    while ($a -le $MaxRetries) {
-        $a++
-        $dateRfc1123 = [DateTime]::UtcNow.ToString("R")
-        $headers = @{
-            "x-ms-date"      = $dateRfc1123
-            "x-ms-version"   = $apiVersion
-            "x-ms-blob-type" = "BlockBlob"
-        }
-        $canonicalizedHeaders  = New-BlobCanonicalizedHeaders -Headers $headers
-        $canonicalizedResource = "/$($StorageContext.AccountName)/$Container/$BlobPath"
-
-        # Shared Key string-to-sign: VERB, then 11 rarely-used HTTP headers left
-        # blank (we authenticate via x-ms-date instead of Date, and don't use
-        # Content-Encoding/Language/MD5/If-*/Range here), then the canonicalized
-        # x-ms-* headers, then the canonicalized resource path.
-        $stringToSign = (@(
-            "PUT", "", "", "$contentLength", "", $ContentType, "", "", "", "", "", ""
-        ) -join "`n") + "`n$canonicalizedHeaders$canonicalizedResource"
-
-        $keyBytes = [Convert]::FromBase64String($StorageContext.AccountKey)
-        $hmac = New-Object System.Security.Cryptography.HMACSHA256
-        $hmac.Key = $keyBytes
-        $sigBytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))
-        $signature = [Convert]::ToBase64String($sigBytes)
-
-        $reqHeaders = @{
-            "x-ms-date"      = $dateRfc1123
-            "x-ms-version"   = $apiVersion
-            "x-ms-blob-type" = "BlockBlob"
-            "Authorization"  = "SharedKey $($StorageContext.AccountName):$signature"
-        }
-        $uri = "https://$($StorageContext.AccountName).blob.core.windows.net/$Container/$BlobPath"
-
-        try {
-            Invoke-RestMethod -Uri $uri -Method PUT -Headers $reqHeaders -Body $bytes -ContentType $ContentType -ErrorAction Stop | Out-Null
-            return
-        } catch {
-            $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-            if ($a -le $MaxRetries) {
-                Write-Log "Blob PUT $Container/$BlobPath -> $s (retry $a in ${RetryWaitSeconds}s): $($_.Exception.Message)" WARN
-                Start-Sleep -Seconds $RetryWaitSeconds
-            } else {
-                Write-Log "Blob PUT $Container/$BlobPath -> $s FAILED (exhausted): $($_.Exception.Message)" ERROR
-                throw
-            }
-        }
-    }
-}
-
-# Creates a container if it doesn't already exist (idempotent -- a 409
-# "already exists" response is treated as success, not an error). Called once
-# per container during INITIALISE so a deleted/mistyped container name fails
-# fast with a clear message instead of every subsequent blob write 404'ing.
-function New-BlobContainerIfMissing {
-    param([Parameter(Mandatory)][string]$Container)
-
-    $apiVersion = "2021-08-06"
-    $dateRfc1123 = [DateTime]::UtcNow.ToString("R")
-    $headers = @{ "x-ms-date" = $dateRfc1123; "x-ms-version" = $apiVersion }
-    $canonicalizedHeaders  = New-BlobCanonicalizedHeaders -Headers $headers
-    $canonicalizedResource = "/$($StorageContext.AccountName)/$Container`nrestype:container"
-
-    $stringToSign = (@(
-        "PUT", "", "", "", "", "", "", "", "", "", "", ""
-    ) -join "`n") + "`n$canonicalizedHeaders$canonicalizedResource"
-
-    $keyBytes = [Convert]::FromBase64String($StorageContext.AccountKey)
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256
-    $hmac.Key = $keyBytes
-    $sigBytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))
-    $signature = [Convert]::ToBase64String($sigBytes)
-
-    $reqHeaders = @{
-        "x-ms-date"     = $dateRfc1123
-        "x-ms-version"  = $apiVersion
-        "Authorization" = "SharedKey $($StorageContext.AccountName):$signature"
-    }
-    $uri = "https://$($StorageContext.AccountName).blob.core.windows.net/${Container}?restype=container"
-
-    try {
-        Invoke-RestMethod -Uri $uri -Method PUT -Headers $reqHeaders -ErrorAction Stop | Out-Null
-        Write-Log "Container '$Container' did not exist -- created it." WARN
-    } catch {
-        $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-        if ($s -eq 409) {
-            # Already exists -- expected on every run after the first, not an error.
-            return
-        }
-        throw "Failed to ensure container '$Container' exists (HTTP $s): $($_.Exception.Message)"
-    }
-}
-
 
 # ==============================================================================
 # MODULE 3 : CLASSIFICATION & NAMING-CONVENTION FUNCTIONS
@@ -561,7 +357,7 @@ function Get-Region { param([string]$s)
     foreach ($k in $RegionPrefixes.Keys) {
         if ($s -match "^$([regex]::Escape($k))([-_ ]|$)") { return $RegionPrefixes[$k] }
     }
-    return "Non-standard"
+    return "Personal"
 }
 function Get-Tier { param([string]$s)
     if ($s -match $TierRegex) { "T$($matches[2])" } else { "Untagged" }
@@ -688,26 +484,9 @@ function Test-AccountAddress { param([string]$a)
 #  ===============================================================================
 #  INITIALISE
 #  ===============================================================================
-# $StorageContext is acquired OUTSIDE the try/finally below: if PamDataStorage
-# itself is missing/malformed, there is no way to upload a log blob anyway (the
-# very thing that would upload it needs this context) -- that one failure mode
-# is only visible in Application Insights, not the Logs container.
-$StorageContext  = Get-StorageAccountContext
-
-# Ensure all three containers exist before anything else runs -- self-heals a
-# deleted/never-created container, and fails fast with a clear message rather
-# than every subsequent blob write 404'ing partway through the run.
-foreach ($c in @($LatestContainer, $ArchiveContainer, $LogsContainer)) {
-    New-BlobContainerIfMissing -Container $c
-}
-
-# Accumulates every Write-Log line so the whole run's log can be uploaded as
-# ONE blob to the Logs container at the end -- inside a try/finally so this
-# still happens even if the run fails partway through (exactly the runs you
-# most want a log for).
-$LogLines = [System.Collections.Generic.List[string]]::new()
-
-try {
+New-Item -ItemType Directory -Path $LatestDir  -Force | Out-Null
+New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null
+if (Test-Path $LogFile) { Remove-Item $LogFile -Force }
 
 $ScriptStartTime = Get-Date
 $ExtractDate     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -715,10 +494,10 @@ $RunErrors       = [System.Collections.Generic.List[string]]::new()
 $RecordCounts    = [ordered]@{}
 
 Write-Log "═══════════════════════════════════════════════════════════" SECTION
-Write-Log " CyberArk Dashboard (PAM + SCA) — Azure Function" SECTION
+Write-Log " CyberArk Dashboard (PAM + SCA)" SECTION
 Write-Log "═══════════════════════════════════════════════════════════" SECTION
 Write-Log "Extract Date : $ExtractDate" INFO
-Write-Log "Output       : $LatestContainer (+ $ArchiveContainer/$ArchivePathPrefix, $LogsContainer/$RunTimestamp.log)" INFO
+Write-Log "Output       : $LatestDir" INFO
 
 #  ===============================================================================
 #  AUTHENTICATE
@@ -727,8 +506,8 @@ Write-Log "=== Authenticate ===" SECTION
 Get-AuthToken
 
 # ===============================================================================
-#  MODULE 4 : PAM DATA COLLECTION (Privilege Cloud)
-#  Creates - DIM_Safe, FACT_Users, FACT_Accounts, FACT_VaultConnectivity, FACT_OnboardingTrend, DIM_Region
+#  MODULE 4 : PAM DATA COLLECTION (Privilege Cloud)                       
+#  Creates - DIM_Safe, FACT_Users, FACT_Accounts, FACT_VaultConnectivity, FACT_OnboardingTrend, DIM_Region                            
 # ===============================================================================
 
 # ── 4.1 Safes → DIM_Safe ──────────────────────────────────────────────────────
@@ -750,7 +529,7 @@ $DimSafe = @(foreach ($s in $SafesRaw) {
         Location      = Safe-String $s.location
         Creator       = Safe-String $s.creator.name
         ManagingCPM   = Safe-String $s.managingCPM
-        NumberOfAccounts = [int]$s.numberOfAccounts
+        NumberOfAccounts = [int]$s.numberOfAccounts  
         OLACEnabled   = $s.olacEnabled
         AutoPurge     = $s.autoPurgeEnabled
         RetentionVersions = $s.numberOfVersionsRetention
@@ -911,6 +690,32 @@ foreach ($sf in $DimSafe) {
     $sf.IsEmpty = ($realCount -eq 0)
 }
 
+# Personal Admin safes only got the "Personal/All-Tiers" placeholder Tier above
+# (their SAFE name has no T0/T1/T2 in it). If any account inside one of them has
+# a PlatformID ending in a real tier suffix (e.g. "...-T1"), use that instead --
+# corrected in place on both DIM_Safe and FACT_Accounts, same pattern as the
+# NumberOfAccounts/IsEmpty fix above. Safes with no such account keep the
+# placeholder unchanged.
+$personalAdminSafes = @($DimSafe | Where-Object { $_.SafeType -eq "Personal Admin" -and $_.Tier -eq $PersonalAdminTierLabel })
+if ($personalAdminSafes.Count -gt 0) {
+    $acctsBySafeName = @{}
+    foreach ($fa in $FactAccounts) {
+        if (-not $acctsBySafeName.ContainsKey($fa.SafeName)) { $acctsBySafeName[$fa.SafeName] = [System.Collections.Generic.List[object]]::new() }
+        $acctsBySafeName[$fa.SafeName].Add($fa)
+    }
+    foreach ($sf in $personalAdminSafes) {
+        if (-not $acctsBySafeName.ContainsKey($sf.SafeName)) { continue }
+        $platformTier = $null
+        foreach ($acct in $acctsBySafeName[$sf.SafeName]) {
+            if ($acct.PlatformID -match $PersonalAdminPlatformTierRegex) { $platformTier = "T$($matches[1])"; break }
+        }
+        if ($platformTier) {
+            $sf.Tier = $platformTier
+            foreach ($acct in $acctsBySafeName[$sf.SafeName]) { $acct.Tier = $platformTier }
+        }
+    }
+}
+
 # ── 4.4 Vault Connectivity → FACT_VaultConnectivity ──────────────────────────
 Write-Log "=== 4.4: Fetching Vault Connectivity ===" SECTION
 $VaultRows = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -977,7 +782,7 @@ foreach ($k in $RegionPrefixes.Keys) {
         $DimRegion.Add([pscustomobject]@{ RegionKey=$rn; RegionName=$rn; Prefixes=$prefixes })
     }
 }
-$DimRegion.Add([pscustomobject]@{ RegionKey="Non-standard"; RegionName="Non-standard"; Prefixes="" })
+$DimRegion.Add([pscustomobject]@{ RegionKey="Personal"; RegionName="Personal"; Prefixes="" })
 $DimRegion.Add([pscustomobject]@{ RegionKey="N/A-Default"; RegionName="N/A-Default"; Prefixes="" })
 $RecordCounts["DIM_Region"] = $DimRegion.Count
 
@@ -1029,40 +834,38 @@ Write-Log "SCA Policies: $($ScaPolicies.Count)" SUCCESS
 $RecordCounts["SCA_Policies"] = $ScaPolicies.Count
 
 # ===============================================================================
-# MODULE 6 : CSV EXPORT
-# Writes CSVs (PAM + SCA) to Blob Storage -- "Latest/<name>.csv" (overwritten
-# each run, the Power BI data source) AND "Archive/<RunTimestamp>/<name>.csv"
-# (historical snapshot), same as the on-prem Latest\/Archive\ folders.
+# MODULE 6 : CSV EXPORT   
+# Writes csv files (PAM + SCA) to the Latest\ folder.
 # ===============================================================================
-Write-Log "=== 6: Exporting CSV Files to Blob Storage ===" SECTION
+Write-Log "=== 6: Exporting CSV Files ===" SECTION
 
 $CsvExports = @(
-    @{ Name="DIM_Region";            Data=$DimRegion;
+    @{ Name="DIM_Region";            Data=$DimRegion;            File="$LatestDir\DIM_Region.csv";
        Cols=@("RegionKey","RegionName","Prefixes") },
-    @{ Name="DIM_Safe";              Data=$DimSafe;
+    @{ Name="DIM_Safe";              Data=$DimSafe;              File="$LatestDir\DIM_Safe.csv";
        Cols=@("SafeName","SafeUrlId","SafeNumber","Description","Location","Creator","ManagingCPM","NumberOfAccounts","OLACEnabled","AutoPurge","RetentionVersions","RetentionDays","CreatedDate","CreatedDateTime","LastModifiedDateTime","IsDefault","SafeType","Region","Tier","Environment","NamingTechnology","AccessType","Team","TeamName","SafePurpose","HasCPM","IsEmpty","RecentlyCreated","NamingCompliant","ExtractDate") },
-    @{ Name="FACT_Accounts";         Data=$FactAccounts;
+    @{ Name="FACT_Accounts";         Data=$FactAccounts;         File="$LatestDir\FACT_Accounts.csv";
        Cols=@("AccountID","Name","UserName","Address","SafeName","PlatformID","SecretType","IsDefaultSafe","SafeType","Region","Tier","Environment","NamingTechnology","AccessType","Team","TeamName","SafePurpose","OSCategory","AutoManaged","MgmtTechnique","ManualReason","ComplianceStatus","SecretStatus","LastChangeDate","LastChangeDateTime","DaysSinceChange","ExpectedRotationDays","RotationOverdue","LastVerifyDate","DaysSinceVerify","VerifyStatus","LastReconciledDate","IsStale","CreatedDate","CreatedMonth","AccountAgeDays","RecentlyOnboarded","NameCompliant","AddressCompliant","HasAddress","ExtractDate") },
-    @{ Name="FACT_Users";            Data=$FactUsers;
+    @{ Name="FACT_Users";            Data=$FactUsers;            File="$LatestDir\FACT_Users.csv";
        Cols=@("UserName","UserID","Source","UserType","ComponentUser","IsComponent","Enabled","Suspended","Location","FirstName","LastName","Email","VaultAuth","PasswordNeverExpires","LastLoginDate","LastLoginDateTime","DaysSinceLogin","LoginStatus","ExtractDate") },
-    @{ Name="FACT_VaultConnectivity";Data=$VaultRows;
+    @{ Name="FACT_VaultConnectivity";Data=$VaultRows;            File="$LatestDir\FACT_VaultConnectivity.csv";
        Cols=@("ComponentType","InstanceIP","VaultUserName","ComponentVersion","IsLoggedOn","LastLogonDate","ExtractDate") },
-    @{ Name="FACT_OnboardingTrend";  Data=$TrendRows;
+    @{ Name="FACT_OnboardingTrend";  Data=$TrendRows;            File="$LatestDir\FACT_OnboardingTrend.csv";
        Cols=@("Month","Year","MonthNumber","MonthName","AccountsOnboarded","SafesCreated","ExtractDate") },
-    @{ Name="SCA_Policies";          Data=$ScaPolicies;
+    @{ Name="SCA_Policies";          Data=$ScaPolicies;          File="$LatestDir\SCA_Policies.csv";
        Cols=@("PolicyId","Name","Description","Status","StatusLabel","PrimaryStatus","CloudProvider","CloudProviderLabel","CreationDate","LastChanged","StartDate","ExpirationDate","MaxSessionDurationHours","UserEntityCount","RoleEntityCount","FaultCode","StatusTooltipMessage","ExtractDate") }
 )
 
 foreach ($export in $CsvExports) {
     try {
         if ($export.Data.Count -gt 0) {
-            $csvText = ($export.Data | Select-Object -Property $export.Cols | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
+            $export.Data | Export-Csv -Path $export.File -NoTypeInformation -Encoding UTF8 -Force
+            Write-Log "  [OK] $($export.Name) ($($export.Data.Count) rows)" SUCCESS
         } else {
-            $csvText = ($export.Cols | ForEach-Object { '"' + $_ + '"' }) -join ','
+            $headerLine = ($export.Cols | ForEach-Object { '"' + $_ + '"' }) -join ','
+            Set-Content -Path $export.File -Value $headerLine -Encoding UTF8 -Force
+            Write-Log "  [--] $($export.Name) (0 rows - header-only placeholder)" INFO
         }
-        Send-BlobText -Container $LatestContainer  -BlobPath "$($export.Name).csv"                         -Content $csvText
-        Send-BlobText -Container $ArchiveContainer -BlobPath "$ArchivePathPrefix/$($export.Name).csv"      -Content $csvText
-        Write-Log "  [OK] $($export.Name) ($($export.Data.Count) rows)" SUCCESS
     } catch {
         Write-Log "  [FAIL] $($export.Name): $($_.Exception.Message)" ERROR
         $RunErrors.Add("CSV Export ($($export.Name)): $($_.Exception.Message)")
@@ -1070,9 +873,18 @@ foreach ($export in $CsvExports) {
 }
 
 # =============================================================================
-#  MODULE 7 : RUN SUMMARY
-#  Writes run metadata to Blob Storage, prints console/App Insights report.
+#  MODULE 7 : RUN SUMMARY                                                
+#  Archives this run's output, writes run metadata, prints console report.
 # =============================================================================
+
+Write-Log "=== 7: Archive & Metadata ===" SECTION
+try {
+    Get-ChildItem -Path $LatestDir -File | ForEach-Object { Copy-Item -Path $_.FullName -Destination $ArchiveDir -Force }
+    Write-Log "All files archived to: $ArchiveDir" SUCCESS
+} catch {
+    Write-Log "Failed to archive: $($_.Exception.Message)" ERROR
+    $RunErrors.Add("Archive: $($_.Exception.Message)")
+}
 
 $ScriptEndTime   = Get-Date
 $DurationSeconds = [math]::Round(($ScriptEndTime - $ScriptStartTime).TotalSeconds, 1)
@@ -1085,105 +897,65 @@ $RunInfo = [ordered]@{
     RecordCounts      = $RecordCounts
     Errors            = $RunErrors
 }
-$runInfoJson = ($RunInfo | ConvertTo-Json -Depth 4)
-try {
-    Send-BlobText -Container $LatestContainer  -BlobPath "_RunMetadata.json"                         -Content $runInfoJson -ContentType "application/json"
-    Send-BlobText -Container $ArchiveContainer -BlobPath "$ArchivePathPrefix/_RunMetadata.json"      -Content $runInfoJson -ContentType "application/json"
-    Write-Log "Run metadata written to Blob Storage." SUCCESS
-} catch {
-    Write-Log "Failed to write run metadata: $($_.Exception.Message)" ERROR
-    $RunErrors.Add("RunMetadata: $($_.Exception.Message)")
-}
+($RunInfo | ConvertTo-Json -Depth 4) | Out-File -FilePath "$LatestDir\_RunMetadata.json" -Encoding UTF8 -Force
+Write-Log "Run metadata written: $LatestDir\_RunMetadata.json" SUCCESS
 
-# ── Console summary (Application Insights / Functions log stream) ───────────
+# ── Console summary ───────────────────────────────────────────────────────────
 $Divider = "=" * 75; $SubDivider = "-" * 75
 Write-Host ""
-Write-Host $Divider
-Write-Host "  CYBERARK DASHBOARD (PAM + SCA) — AZURE FUNCTION"
-Write-Host "  Generated : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Host "  Duration  : $DurationSeconds seconds"
-Write-Host $Divider
+Write-Host $Divider -ForegroundColor White
+Write-Host "  CYBERARK DASHBOARD (PAM + SCA)" -ForegroundColor White
+Write-Host "  Generated : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor White
+Write-Host "  Duration  : $DurationSeconds seconds" -ForegroundColor White
+Write-Host $Divider -ForegroundColor White
 
 Write-Host ""
-Write-Host "  PAM INVENTORY"
-Write-Host $SubDivider
-Write-Host ("  Safes               : {0} total | {1} business | {2} default" -f $DimSafe.Count, $bizSafes.Count, ($DimSafe.Count - $bizSafes.Count))
-Write-Host ("  Accounts            : {0} total | {1} business" -f $AcctRaw.Count, $biz.Count)
-Write-Host ("  Users               : {0} total | {1} real | {2} active" -f $UsersRaw.Count, $realUsers.Count, @($realUsers | Where-Object { $_.LoginStatus -like 'Active*' }).Count)
+Write-Host "  PAM INVENTORY" -ForegroundColor Cyan
+Write-Host $SubDivider -ForegroundColor DarkGray
+Write-Host ("  Safes               : {0} total | {1} business | {2} default" -f $DimSafe.Count, $bizSafes.Count, ($DimSafe.Count - $bizSafes.Count)) -ForegroundColor White
+Write-Host ("  Accounts            : {0} total | {1} business" -f $AcctRaw.Count, $biz.Count) -ForegroundColor White
+Write-Host ("  Users               : {0} total | {1} real | {2} active" -f $UsersRaw.Count, $realUsers.Count, @($realUsers | Where-Object { $_.LoginStatus -like 'Active*' }).Count) -ForegroundColor White
 
 Write-Host ""
-Write-Host "  PAM COMPLIANCE"
-Write-Host $SubDivider
+Write-Host "  PAM COMPLIANCE" -ForegroundColor Cyan
+Write-Host $SubDivider -ForegroundColor DarkGray
 $compliant = @($biz | Where-Object { $_.ComplianceStatus -eq "Compliant" }).Count
 $compRate  = if ($biz.Count -gt 0) { [math]::Round(($compliant / $biz.Count) * 100, 1) } else { 0 }
-Write-Host ("  Compliance Rate     : {0}%" -f $compRate)
-Write-Host ("  Rotation Overdue    : {0}" -f @($biz | Where-Object { $_.RotationOverdue }).Count)
-Write-Host ("  Empty Safes         : {0}" -f @($bizSafes | Where-Object { $_.IsEmpty }).Count)
+Write-Host ("  Compliance Rate     : {0}%" -f $compRate) -ForegroundColor $(if ($compRate -ge 90) { "Green" } elseif ($compRate -ge 70) { "Yellow" } else { "Red" })
+Write-Host ("  Rotation Overdue    : {0}" -f @($biz | Where-Object { $_.RotationOverdue }).Count) -ForegroundColor White
+Write-Host ("  Empty Safes         : {0}" -f @($bizSafes | Where-Object { $_.IsEmpty }).Count) -ForegroundColor White
 
 Write-Host ""
-Write-Host "  PAM VAULT CONNECTIVITY"
-Write-Host $SubDivider
+Write-Host "  PAM VAULT CONNECTIVITY" -ForegroundColor Cyan
+Write-Host $SubDivider -ForegroundColor DarkGray
 foreach ($compType in $VaultComponentIDs) {
     $typeRows = @($VaultRows | Where-Object { $_.ComponentType -eq $compType })
     $loggedOn = @($typeRows | Where-Object { $_.IsLoggedOn -eq "TRUE" }).Count
     if ($typeRows.Count -gt 0) {
-        Write-Host ("  {0,-20} : {1} total | {2} connected" -f $compType, $typeRows.Count, $loggedOn)
+        Write-Host ("  {0,-20} : {1} total | {2} connected" -f $compType, $typeRows.Count, $loggedOn) -ForegroundColor $(if ($loggedOn -lt $typeRows.Count) { "Red" } else { "Green" })
     }
 }
 
 Write-Host ""
-Write-Host "  SCA ACCESS POLICIES"
-Write-Host $SubDivider
-Write-Host ("  Total Policies      : {0}" -f $ScaPolicies.Count)
-Write-Host ("  Active Policies     : {0}" -f @($ScaPolicies | Where-Object StatusLabel -eq "Active").Count)
-Write-Host ("  Error Policies      : {0}" -f @($ScaPolicies | Where-Object StatusLabel -eq "Error").Count)
+Write-Host "  SCA ACCESS POLICIES" -ForegroundColor Cyan
+Write-Host $SubDivider -ForegroundColor DarkGray
+Write-Host ("  Total Policies      : {0}" -f $ScaPolicies.Count) -ForegroundColor White
+Write-Host ("  Active Policies     : {0}" -f @($ScaPolicies | Where-Object StatusLabel -eq "Active").Count) -ForegroundColor Green
+Write-Host ("  Error Policies      : {0}" -f @($ScaPolicies | Where-Object StatusLabel -eq "Error").Count) -ForegroundColor $(if (@($ScaPolicies | Where-Object StatusLabel -eq "Error").Count -gt 0) { "Red" } else { "Green" })
 
 Write-Host ""
-Write-Host "  OUTPUT"
-Write-Host $SubDivider
-Write-Host ("  CSV Files           : {0}" -f $CsvExports.Count)
-Write-Host ("  Latest (Power BI)   : {0}" -f $LatestContainer)
-Write-Host ("  Archive (This Run)  : {0}/{1}" -f $ArchiveContainer, $ArchivePathPrefix)
-Write-Host ("  Log (This Run)      : {0}/{1}.log" -f $LogsContainer, $RunTimestamp)
-Write-Host ("  Duration            : {0}s" -f $DurationSeconds)
-Write-Host ("  Errors              : {0}" -f $RunErrors.Count)
+Write-Host "  OUTPUT" -ForegroundColor Cyan
+Write-Host $SubDivider -ForegroundColor DarkGray
+Write-Host ("  CSV Files           : {0}" -f $CsvExports.Count) -ForegroundColor Green
+Write-Host ("  Latest (Power BI)   : {0}" -f $LatestDir) -ForegroundColor Green
+Write-Host ("  Archive (This Run)  : {0}" -f $ArchiveDir) -ForegroundColor Green
+Write-Host ("  Duration            : {0}s" -f $DurationSeconds) -ForegroundColor White
+Write-Host ("  Errors              : {0}" -f $RunErrors.Count) -ForegroundColor $(if ($RunErrors.Count -gt 0) { "Red" } else { "Green" })
 if ($RunErrors.Count -gt 0) {
     Write-Host ""
-    Write-Host "  Error Details:"
-    foreach ($err in $RunErrors) { Write-Host "    * $err" }
+    Write-Host "  Error Details:" -ForegroundColor Red
+    foreach ($err in $RunErrors) { Write-Host "    * $err" -ForegroundColor Red }
 }
 Write-Host ""
-Write-Host $Divider
+Write-Host $Divider -ForegroundColor White
 Write-Log "=== CyberArk Dashboard Complete ===" SECTION
-
-} catch {
-    Write-Log "FATAL: $($_.Exception.Message)" ERROR
-    $FatalError = $_
-} finally {
-    # Upload the accumulated log as one blob, named by run timestamp, regardless
-    # of whether the run above succeeded or threw -- a failed run's log is the
-    # one you most need to see.
-    try {
-        $logText = ($LogLines -join "`r`n")
-        Send-BlobText -Container $LogsContainer -BlobPath "$RunTimestamp.log" -Content $logText -ContentType "text/plain; charset=utf-8"
-    } catch {
-        $uploadErrMsg = "Failed to upload log blob to '$LogsContainer/$RunTimestamp.log': $($_.Exception.Message)"
-        Write-Host $uploadErrMsg
-        # Fallback so this is visible WITHOUT Application Insights access: write
-        # the caught error itself into the Latest container, which by this point
-        # in the run has already proven to accept writes successfully.
-        try {
-            Send-BlobText -Container $LatestContainer -BlobPath "_LastLogUploadError.txt" -Content $uploadErrMsg -ContentType "text/plain; charset=utf-8"
-        } catch {
-            # Nothing more we can do to surface this -- both the intended log
-            # write and this fallback failed. Falls through to Write-Host only.
-        }
-    }
-}
-
-if ($FatalError) {
-    # Re-throw after the log is safely uploaded, so Azure Functions still marks
-    # this invocation as Failed (for retry policy / monitoring) rather than
-    # silently swallowing the error.
-    throw $FatalError
-}
