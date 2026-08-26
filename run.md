@@ -21,16 +21,16 @@
 ## Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [Phase 1 : The PowerShell Export Script](#2-phase-1--the-powershell-export-script)
+2. [The PowerShell Export Script](#2-the-powershell-export-script)
    - 2.1 Purpose
    - 2.2 Output data set
    - 2.3 Key classification flags computed by the script
    - 2.4 How the script is structured (for maintaining it)
    - 2.5 The Archive folder and historical snapshots
-3. [Phase 1 : The Power BI Dashboard](#3-phase-1--the-power-bi-dashboard)
+3. [The Power BI Dashboard](#3-the-power-bi-dashboard)
    - 3.1 Columns required in the data model, per source file
    - 3.2 Reference DAX for the core KPIs
-4. [Phase 2 : Migration to Azure Function App](#4-phase-2--migration-to-azure-function-app)
+4. [Migration to Azure Function App](#4-migration-to-azure-function-app)
    - 4.1 Problem statement: why the original process needed to change
    - 4.2 The solution: Azure Function App
    - 4.3 Azure resources provisioned
@@ -49,25 +49,25 @@
 
 ## 1. Executive Summary
 
-This implementation delivers automated, scheduled reporting on CyberArk Privileged Cloud (PAM) safe/account inventory, compliance, and Secure Cloud Access (SCA) policy status through a Power BI dashboard. The solution has gone through two complete implementation phases:
+This implementation delivers automated, scheduled reporting on CyberArk Privileged Cloud (PAM) safe/account inventory, compliance, and Secure Cloud Access (SCA) policy status through a Power BI dashboard. The solution has gone through two complete implementation stages:
 
-- **Phase 1**: A PowerShell script (`PAM_SCA_Dashboard_Final.ps1`) was built to authenticate once to CyberArk and pull data from both the Privilege Cloud API and the Secure Cloud Access API, producing the CSV data set feeding the Power BI dashboard's data model and visuals. The dashboard was built on top of this data set and is in active use.
-- **Phase 2**: To remove the operational overhead of a script running on a server via a local scheduled task (see 4.1), the decision was made to modernize the pipeline onto a fully automated, serverless Azure Function App. This migration is complete and has been validated against live CyberArk data. The Power BI dashboard — visuals, measures, data model — is unchanged by this migration. Only the underlying data pipeline was re-platformed.
+- A standalone PowerShell script (`PAM_SCA_Dashboard_Final.ps1`) was developed to authenticate to CyberArk and collect data from both the Privilege Cloud API and the Secure Cloud Access API. The script generates the CSV dataset used by the Power BI dashboard.
+- To enhance automation, reliability, and maintainability, the same functionality was subsequently implemented as a serverless Azure Function App. This approach removes the dependency on a dedicated server and local scheduled tasks while retaining the existing Power BI dashboard, including its data model, measures, and visualizations. The Azure Function App has been successfully validated against live CyberArk data, with only the backend data pipeline being modernized.
 
-This document provides a comprehensive reference for both phases, detailing what was delivered and its current operational model.
+This document provides a comprehensive reference for both stages, detailing what was delivered and its current operational model.
 
 **Related documents:**
 
 | Document | Covers |
 |---|---|
-| `PAM_SCA_Dashboard_Final.ps1` (repo root) | The on-prem PowerShell export script (Phase 1) |
-| `AzureFunction/DashboardExport/run.ps1` (repo) | The Azure Function version of the same script (Phase 2) |
+| `PAM_SCA_Dashboard_Final.ps1` (repo root) | The original on-prem PowerShell export script |
+| `AzureFunction/DashboardExport/run.ps1` (repo) | The Azure Function version of the same script |
 | `Antigravity_Dashboard_Guide_V13.md` | Power BI DAX measures, relationships, and visual configuration |
 | `Technical_Documentation_V1.md` | Full line-by-line technical walkthrough of both script versions, module by module |
 
 ---
 
-## 2. Phase 1 : The PowerShell Export Script
+## 2. The PowerShell Export Script
 
 ### 2.1 Purpose
 
@@ -124,7 +124,7 @@ In the Azure Function version, `Archive` is a Blob Storage container (same name,
 
 ---
 
-## 3. Phase 1 : The Power BI Dashboard
+## 3. The Power BI Dashboard
 
 The dashboard's full DAX measure library, table relationships, and visual layout are documented in detail separately in `Antigravity_Dashboard_Guide_V13.md`.
 
@@ -178,7 +178,7 @@ CALCULATE(COUNTROWS(SCA_Policies), SCA_Policies[StatusLabel] = "Active")
 
 ---
 
-## 4. Phase 2 : Migration to Azure Function App
+## 4. Migration to Azure Function App
 
 ### 4.1 Problem statement: why the original process needed to change
 
