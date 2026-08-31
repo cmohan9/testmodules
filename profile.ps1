@@ -1,1220 +1,859 @@
 <#
 .SYNOPSIS
-    CyberArk Power BI Dashboard Data Exporter — Privilege Cloud + Secure Cloud
-    Access (SCA) — Azure Functions (Flex Consumption) Timer Trigger version.
+    Privilege Cloud License Capacity User Report
+
 .DESCRIPTION
-    READ-ONLY script that authenticates once to CyberArk and exports both the
-    Privilege Cloud (PAM) data and the Secure Cloud Access (SCA) data as CSVs
-    into Azure Blob Storage, replacing the on-prem scheduled-task version
-    (PAM_SCA_Dashboard_Final.ps1) which wrote to local Latest\/Archive\ folders.
+    This PowerShell script generates a comprehensive report of users consuming resources in the Privilege Cloud for a given tenant URL.
+    The report includes information about users of different types and their last login dates.
+    Additionally, it identifies users who have been inactive for more than a specified number of days.
+    It also detects and reports users returned by the API without an assigned UserType.
 
-    MODULES (same organization as the on-prem script):
-      MODULE 1 — Configuration            (Sections A-J, unchanged business rules;
-                                            Section A credentials now read from
-                                            environment variables/App Settings)
-      MODULE 2 — Shared helpers           (logging, auth, HTTP retry wrappers,
-                                            + Blob Storage REST helper — new)
-      MODULE 3 — Classification functions (region/tier/safe-type/team-tag parsing
-                                            — byte-for-byte unchanged, pure functions)
-      MODULE 4 — PAM data collection      (Privilege Cloud: Safes/Users/Accounts/
-                                            Vault/Onboarding — unchanged logic)
-      MODULE 5 — SCA data collection      (Secure Cloud Access: Policies —
-                                            unchanged logic)
-      MODULE 6 — CSV export               (writes to Blob Storage instead of a
-                                            local folder; same column schemas)
-      MODULE 7 — Run summary               (console/App Insights report + run
-                                            metadata JSON, written to Blob Storage)
+.PARAMETER PortalURL
+    Specifies the URL of the Privilege Cloud tenant.
+    Example: https://<subdomain>.cyberark.cloud
 
-    WHAT CHANGED FROM THE ON-PREM SCRIPT (everything else is identical):
-      - Section A credentials come from environment variables (Application
-        Settings in the Function App), not hardcoded values.
-      - All local file I/O (Export-Csv/Set-Content/Out-File to Latest\/Archive\,
-        plus the local log file) is replaced with raw calls to the Azure Blob
-        Storage REST API, signed with Shared Key (HMAC-SHA256) using only
-        built-in .NET crypto (System.Security.Cryptography) — no Az.Storage or
-        any other external module, since Flex Consumption does not support
-        managed dependencies.
-      - Output goes to a SEPARATE storage account (its connection string in
-        the PamDataStorage app setting — distinct from the Function App's own
-        AzureWebJobsStorage, which is only used for the platform's internal
-        bookkeeping) with three top-level containers standing in for the old
-        folder structure: "Latest" (current CSVs + run metadata, the Power BI
-        source), "Archive" (one "<RunTimestamp>/" blob-name prefix per run,
-        i.e. one "folder" per historical run), and "Logs" (one log blob per
-        run, named "<RunTimestamp>.log").
-      - Write-Log still writes via Write-Host (captured by Application
-        Insights automatically) AND accumulates every line into $LogLines,
-        uploaded as one blob to the Logs container at the end of the run —
-        inside a try/finally so this still happens even if the run fails
-        partway through.
-      - Get-AuthToken now `throw`s instead of `exit 1` on failure to
-        authenticate — inside an Azure Functions PowerShell worker, `exit`
-        would kill the whole worker process; `throw` correctly fails just
-        this invocation so the platform logs/retries it properly.
-.MODE
-    READ-ONLY (GET requests only to CyberArk; only Blob Storage PUT calls write
-    data, and only to your own storage account — no changes are made to CyberArk)
-.NOTES
-    Author   : Mohan C
-    Requires : Azure Functions PowerShell 7.4 worker, Flex Consumption plan
-               A CyberArk service account with:
-                 - Privilege Cloud Administrator or Auditor role (for the PAM module)
-                 - The SCA API role granted in Identity Administration
+.PARAMETER InactiveDays
+    Specifies the number of days to consider users as inactive.
+    Default value: 60
+
+.PARAMETER ExportToCSV
+    Specifies whether to export the results to a CSV file or print them in PowerShell.
+    If this switch is specified, the results will be exported to CSV files.
+
+.PARAMETER GetSpecificUserTypes
+    Specifies the UserTypes you want to get a report on.
+    Default values: EPVUser, EPVUserLite, BasicUser, ExtUser, BizUser, AIMAccount, AppProvider, CCP, CCPEndpoints, CPM, PSM
+
+.PARAMETER ReportType
+    Specifies the type of report to generate.
+    Valid values are 'CapacityReport' and 'DetailedReport'.
+
+.PARAMETER Credentials
+    Specifies a user with the relevant permissions.
+
+.PARAMETER ForceAuthType
+    Specifies the authentication type.
+    Valid values are 'cyberark' and 'identity'.
+
+.EXAMPLE
+    .\PrivilegeCloudConsumedUserReport.ps1 -PortalURL "https://<subdomain>.cyberark.cloud" -InactiveDays 90 -ExportToCSV -GetSpecificUserTypes EPVUser, BasicUser -ReportType DetailedReport
 #>
 
-param($Timer)
+param(
+    [Parameter(Mandatory = $true, HelpMessage = "Specify the URL of the Privilege Cloud tenant (e.g., https://<subdomain>.cyberark.cloud)")]
+    [string]$PortalURL,
 
-if ($Timer -and $Timer.IsPastDue) {
-    Write-Host "Timer is running late — a previous invocation may have overrun the schedule." -ForegroundColor Yellow
-}
+    [Parameter(Mandatory = $false, HelpMessage = "Specify the number of days to consider users as inactive.")]
+    [int]$InactiveDays = 60,
 
-#=========================================================================
-# MODULE 1 : CONFIGURATION
-#=========================================================================
+    [switch]$ExportToCSV,
 
-# ── Section A: Credentials (from environment variables / App Settings) ──────
-$IdentityTenantId  = $env:IDENTITY_TENANT_ID
-$ServiceUserId     = $env:SERVICE_USER_ID
-$ServiceUserSecret = $env:SERVICE_USER_SECRET
-$Subdomain         = $env:SUBDOMAIN
-$ScaSubdomain      = $env:SCA_SUBDOMAIN
+    [Parameter(Mandatory = $false, HelpMessage = "Specify the UserTypes you want to get a report on.")]
+    [ValidateSet("EPVUser", "EPVUserLite", "BasicUser", "ExtUser", "BizUser", "AIMAccount", "AppProvider", "CCP", "CCPEndpoints", "CPM", "PSM")]
+    [string[]]$GetSpecificuserTypes = @("EPVUser", "EPVUserLite", "BasicUser", "ExtUser", "BizUser", "AIMAccount", "AppProvider", "CCP", "CCPEndpoints", "CPM", "PSM"),
 
-foreach ($required in @("IDENTITY_TENANT_ID","SERVICE_USER_ID","SERVICE_USER_SECRET","SUBDOMAIN","SCA_SUBDOMAIN")) {
-    if ([string]::IsNullOrWhiteSpace((Get-Item "env:$required" -ErrorAction SilentlyContinue).Value)) {
-        throw "Required app setting '$required' is missing or empty. Configure it in the Function App's Environment Variables."
-    }
-}
+    [Parameter(Mandatory = $false, HelpMessage = "Specify the type of report to generate. Valid values are 'CapacityReport' and 'DetailedReport'.")]
+    [ValidateSet("DetailedReport", "CapacityReport")]
+    [string]$ReportType,
 
-# ── Section B: Thresholds & Windows ──────────────────────────────────────────
-$LoginWindowDays      = 30     # Users considered "active" if logged in within N days
-$OnboardingWindowDays = 30     # Accounts/safes "recently onboarded" if created within N days
-$StaleAccountDays     = 90     # No password change in N days = stale
-$VerifyOverdueDays    = 7      # Verification must occur every N days
-$TrendLookbackMonths  = 12     # Onboarding trend history depth
+    [Parameter(Mandatory = $true, HelpMessage = "Specify a User with the relevant permissions. See readme if you need help.")]
+    [PSCredential]$Credentials,
 
-# ── Section C: Runtime Config ────────────────────────────────────────────────
-$PageLimit          = 1000
-$MaxRetries         = 4
-$RetryWaitSeconds   = 5
-
-# ── Section D: Default System Objects ────────────────────────────────────────
-# Items listed here are filtered out of "business" metrics (they're CyberArk
-# internal objects). Add new CPM/PSM safes when new CPM/PSM components Installed.
-
-$DefaultSafes = @(
-    "System","VaultInternal","Pinstore","Notification Engine","SharedAuth_Internal",
-    "PVWAConfig","PVWAReports","PVWATaskDefinitions","PVWAPrivateUserPrefs","PVWAUserPrefs",
-    "PVWATicketingSystem","PSM","PSMLiveSessions","PSMRecordings","PSMUniversalConnectors",
-    "PSMNotifications","PSMSessionBackups","PasswordManager","PasswordManager_Pending",
-    "PasswordManager_workspace","PasswordManager_ADInternal","PasswordManager_Info",
-    "AccountsFeedADAccounts","AccountsFeedDiscoveryLogs","ConjurSync","TelemetryConfig",
-    "APAC-CARK-EPM-1","APAC-CARK-EPM-1_Accounts","De2vs1275","De2vs1275_Accounts","EMEA-PSM",
-    "OCA-PSM","APAC-PSM","OT-CARK-PAM1","OT-CARK-PAM1_Accounts","OT-PSM","ams-CArk-epam2",
-    "ams-CArk-epam2_Accounts","PSM","PSMUniversalConnectors","PVWATicketingSystem","TelemetryConfig",
-    "de2vs1287","de2vs1287_Accounts","EMEA-PSM-T0","SGAZCLPDVMCARK1","SGAZCLPDVMCARK1_Accounts",
-    "APAC_PSM_T0","Test_Notifications-Deloitte"
+    [ValidateSet("cyberark","identity")]
+    [string]$ForceAuthType
 )
 
-$DefaultSafePrefixes = @("PVWA*","PSM*","PasswordManager*","AccountsFeed*","SharedAuth*")
+$ScriptLocation = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# Modules
+# NOTE: paths are resolved relative to $ScriptLocation (the script's own folder),
+# not the current working directory, so this works regardless of where the
+# script is invoked from.
+$mainModule = "Import_AllModules.psm1"
 
-$DefaultMembersPatterns = @(
-    "Administrator","Auditor","Backup","Batch","Master","DR","PasswordManager*",
-    "PVWAGWUser","PVWAAppUser","PVWAGWAccounts","PSMApp_*","PSMGw_*","PSMAppUsers",
-    "PSMPTAAppUsers","PSM_*","PTAAppUser","GWUser","ConjurSync","TelemetryUser*",
-    "CyberarkRotationService","CyberarkAccountsIntegration",
-    "CyberarkAccessService","CyberarkDiscoveryService",
-    "InstallerUser@*","PSMMaster","Privilege Cloud Session Admin",
-    "Backup Users","Auditors","DR Users","Notification Engines","Operators",
-    "*_admin", "ams-CArk-epam2", "APAC-CARK-EPM-1", "De2vs1275","OT-CARK-PAM1","de2vs1287",
-    "CyberarkAccountsIntegration","CyberarkRotationService","CyberarkAccessService","NotificationEngine",
-    "USER-PVWA-74DA3E79-2874-4057-98A1-1E396D9A2199","CyberarkDiscoveryService","PVWAAppUser","PSMApp_ams-CArk-epam3",
-    "PSMGw_ams-CArk-epam3","ams-CArk-epam2","PSMApp_ams-CArk-epam2","PSMGw_ams-CArk-epam2","PSMApp_apac-CArk-epm-2",
-    "PSMGw_apac-CArk-epm-2","APAC-CARK-EPM-1","PSMApp_apac-CArk-epm-1","PSMGw_apac-CArk-epm-1","De2vs1275","PSMApp_De2vs1275",
-    "PSMGw_De2vs1275","PSMApp_de2vs1276","PSMGw_de2vs1276","OT-CARK-PAM1","PSMApp_OT-CARK-PAM1","PSMGw_OT-CARK-PAM1",
-    "PSMApp_OT-CARK-PAM2","PSMGw_OT-CARK-PAM2","LS_SSU_74DA3E79-2874-4057-98A1-1E396D9A2199","de2vs1287","PSMApp_de2vs1287",
-    "PSMGw_de2vs1287","test","SGAZCLPDVMCARK1","PSMApp_SGAZCLPDVMCARK1","PSMGw_SGAZCLPDVMCARK1","PVWAAppUser2","PVWAGWUser","TelemetryUser"
-
+$modulePaths = @(
+    (Join-Path $ScriptLocation "..\PS-Modules\$mainModule"),
+    (Join-Path $ScriptLocation "..\..\PS-Modules\$mainModule"),
+    (Join-Path $ScriptLocation "PS-Modules\$mainModule"),
+    (Join-Path $ScriptLocation $mainModule),
+    (Join-Path $ScriptLocation "..\$mainModule"),
+    (Join-Path $ScriptLocation "..\..\$mainModule")
 )
 
-# ── Section E: Naming Conventions — Region, Tier, Safe Type, Team Tagging ────
-$RegionPrefixes = [ordered]@{
-    "OCA"  = "OCA"
-    "APAC" = "APAC"
-    "EMEA" = "EMEA"
-    "JP"   = "JP"
-    "OT"   = "JP"
-    "GLB"  = "Global"
-
-}
-$TierRegex = '(^|[-_ ])T([012])([-_ ]|$)'   # Captures T0/T1/T2 from the safe name.
-
-# Safe type classification (admin vs business): not every safe carries a region
-# prefix. Admin safes are identified by suffix:
-#   *-ADM         => "Personal Admin"  (user-specific personal admin accounts)
-#   *-T0/-T1/-T2  => "Shared Admin"    (shared admin accounts for that tier)
-# Anything else non-default => "Standard Business". Default/system safes => "System/Default".
-
-$PersonalAdminSuffixRegex = '-ADM$'
-$SharedAdminSuffixRegex   = '-T[012]$'
-$PersonalAdminTierLabel   = 'Personal/All-Tiers'   # used when no T0/T1/T2 token is present
-# Personal Admin safes carry no tier in their own NAME -- but the accounts inside
-# them often have a PlatformID that DOES end in a tier suffix (e.g. "...-T1").
-# When present, that becomes the safe's (and its accounts') real Tier instead of
-# the placeholder above -- see the correction pass in Module 4.3.
-$PersonalAdminPlatformTierRegex = '-T([012])$'
-
-# Safe name validation: business safe names SHOULD match this regex. Auto-builds
-# from $RegionPrefixes keys if left empty; -ADM/-T0/-T1/-T2 admin safes are ALSO
-# treated as naming-compliant (region optional for them).
-$SafeNameExpectedRegex = ''
-
-
-# Team/Application tag format (HLD):
-#   REGION-ENV-TECHNOLOGY-ACCESSTYPE-TEAM
-#   e.g. OCA-P-LIN-LA-SAN, APAC-P-WIN-DA-BKP
-#
-# Region must match $RegionPrefixes. Env, Technology, and AccessType use
-# predefined valid codes. Team is free-form (e.g. SPLUNK).
-#
-# Matching is case-insensitive; aliases such as P, Prod, and PROD are treated alike.
-#
-# Shared Admin (-T0/-T1/-T2) and Personal Admin (-ADM) suffixes are removed
-# before parsing. Purpose suffixes (-LOGON/-SCAN/-RECONCILE) are also removed.
-#
-# System/Default safes are tagged "N/A (Default)" and are not parsed.
-# Unmatched names are tagged "Not Tagged".
-
-$EnvironmentTokens = [ordered]@{
-    "P" = "Production"; "PROD" = "Production"
-    "D" = "Development"; "DEV" = "Development"
-    "T" = "Testing"; "TEST" = "Testing"
-    "Q" = "Q/A"; "QA" = "Q/A"
-}
-$TechnologyTokens = [ordered]@{
-    "WIN" = "Windows"; "LIN" = "Linux"; "WKS" = "Workstation"; "NET" = "Network Device"
-    "DB"  = "Database"; "SQL" = "SQL Database"; "ORC" = "Oracle Database"; "HTTP" = "Browser-Based Application"
-
-}
-$AccessTypeTokens = [ordered]@{
-    "LA"  = "Local Account"; "LSA" = "Local Service Account"; "DSA" = "Domain Service Account"
-    "ENA" = "Enable Account"; "DA"  = "Domain Account"
-
-}
-# Business Unit / Team codes -> friendly display names. Codes NOT on this list
-# (e.g. an app name like "SPLUNK") pass through as the raw code — expected, not an error.
-$TeamCodeMap = [ordered]@{
-    "SEC"="Security Team"; "SOC"="Security Operations Center"; "DBA"="Database Administrators"
-    "ENG"="Engineering Team"; "SUP"="Support Desk"; "NWR"="Network Team (Routers)"
-    "NWS"="Network Team (Switches/Security)"; "ISD"="Infra & Service Delivery"
-    "UAM"="User Access Management"; "SAN"="Storage Area Network"; "BKP"="Backup"
-    "EPS"="Endpoint Security"; "CTX"="Citrix"; "SIEM"="SIEM"; "MDW"="Middleware"
-    "SAP"="SAP"; "TLS"="Tools"; "CMDB"="CMDB"; "VAPT"="Vulnerability & Pen Testing"
-    "NSG"="Network Security Group"; "VDI"="VDI"; "CLD"="Cloud"; "MSG"="Messaging"
-
-}
-# Trailing suffix => this safe holds a Cyberark Specific account type, checked
-$SafePurposeSuffixes = [ordered]@{
-    "LOGON" = "Logon Accounts"; "SCAN" = "Scan/Discovery Accounts"; "RECONCILE" = "Reconciliation Accounts"
-}
-
-# ── Section F: Platform Classification Patterns ──────────────────────────────
-# Classifies accounts by OS/software category based on platformId.
-$WindowsPlatformPatterns  = @("*Win*","*Windows*","*WinServer*","*WinDomain*","*NDC*")
-$UnixPlatformPatterns     = @("*Unix*","*Linux*","*Lin*","*SSH*","*AIX*","*Solaris*","*HPUX*","*RHEL*")
-$DatabasePlatformPatterns = @("*Oracle*","*MSSQL*","*MySQL*","*Postgres*","*DB2*","*Database*","*SQL*")
-$CloudPlatformPatterns    = @("*AWS*","*Azure*","*GCP*","*Cloud*")
-$NetworkPlatformPatterns  = @("*Cisco*","*F5*","*Palo*","*Firewall*","*Switch*","*Router*","*Network*")
-
-# ── Section G: Rotation Policy Map ───────────────────────────────────────────
-# Maps platformId patterns to expected rotation days.
-$RotationPolicyDays = [ordered]@{
-    "*365*" = 365; "*Oracle*" = 365; "*Service*" = 365
-    "*Win*" = 45; "*Unix*" = 45; "*Linux*" = 45; "*SSH*" = 45
-}
-$DefaultRotationDays = 45
-
-# ── Section H: Vault Component Types for Health Monitoring ───────────────────
-$VaultComponentIDs = @("CPM","SessionManagement","AIM")
-
-# ── Section I: Account Name & Address Validation (optional - for future reference)
-# Leave empty ('') to disable.
-$AccountNameExpectedRegex    = ''   # e.g. '^[a-zA-Z0-9_\-\.]+$'
-$AccountAddressExpectedRegex = ''   # e.g. '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
-
-# ── Section J: SCA Reference Data ────────────────────────────────────────────
-$PolicyStatusMap = @{ 1 = "Active"; 3 = "Expired"; 4 = "Error"; 6 = "Validating" }
-$CloudProviderMap = @{
-    0 = "AWS (IAM)"; 1 = "Google Cloud"; 2 = "Azure (resource)"
-    3 = "AWS (IAM Identity Center)"; 4 = "Azure (Microsoft Entra ID)"
-}
-
-
-# ==============================================================================
-# URLS & STORAGE TARGETS
-# ==============================================================================
-$IdentityUrl = "https://$IdentityTenantId.id.cyberark.cloud"
-$PvwaBase    = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault/API"
-$ScaBase     = "https://$ScaSubdomain.sca.cyberark.cloud/api"
-
-# Blob Storage output target -- a separate storage account (PamDataStorage app
-# setting), NOT the Function App's own AzureWebJobsStorage. Container names
-# are overridable via LATEST_CONTAINER/ARCHIVE_CONTAINER/LOGS_CONTAINER in
-# case you ever want output to land somewhere other than the defaults below.
-# Azure Blob Storage container names MUST be lowercase (a hard platform rule --
-# 3-63 chars, lowercase letters/numbers/hyphens only), so these defaults are
-# lowercase even though the Portal UI may display them with a capital first
-# letter. If you set LATEST_CONTAINER/ARCHIVE_CONTAINER/LOGS_CONTAINER
-# yourself, use the exact (lowercase) name Azure actually stored.
-$LatestContainer  = if ([string]::IsNullOrWhiteSpace($env:LATEST_CONTAINER))  { "latest"  } else { $env:LATEST_CONTAINER }
-$ArchiveContainer = if ([string]::IsNullOrWhiteSpace($env:ARCHIVE_CONTAINER)) { "archive" } else { $env:ARCHIVE_CONTAINER }
-$LogsContainer    = if ([string]::IsNullOrWhiteSpace($env:LOGS_CONTAINER))   { "logs"    } else { $env:LOGS_CONTAINER }
-$RunTimestamp      = Get-Date -Format "yyyyMMdd_HHmmss"
-$ArchivePathPrefix = $RunTimestamp   # blob-name prefix within the Archive container -- its own "folder" per run
-
-if ([string]::IsNullOrWhiteSpace($SafeNameExpectedRegex)) {
-    $prefixAlts = ($RegionPrefixes.Keys | ForEach-Object { [regex]::Escape($_) }) -join '|'
-    $SafeNameExpectedRegex = "^($prefixAlts)[-_ ]"
-}
-
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
-
-
-# ==============================================================================
-# MODULE 2 : HELPERS
-# Logging, authentication (ONE token, reused for both PAM and SCA calls),
-# and Blob Storage REST helper (replaces local file I/O).
-# ==============================================================================
-
-function Write-Log {
-    param([string]$Message,
-          [ValidateSet("INFO","WARN","ERROR","SUCCESS","DEBUG","SECTION")][string]$Level="INFO")
-    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$Level,$Message
-    # Write-Host is captured by Application Insights / the Functions log stream
-    # automatically. Also accumulated into $LogLines (initialized in INITIALISE,
-    # below) so the whole run's log can be uploaded as one blob to the Logs
-    # container -- including on failure, via the try/finally around the run.
-    Write-Host $line
-    # Explicit null check, NOT `if ($LogLines)` -- an empty List[string] evaluates
-    # to $false in a boolean context in PowerShell, which would make this check
-    # permanently false for a list that starts empty (it can never become
-    # non-empty if .Add() is gated behind its own emptiness).
-    if ($null -ne $LogLines) { $LogLines.Add($line) }
-}
-
-# ── Auth (with auto-refresh). One token is used for BOTH Privilege Cloud and SCA
-#    calls -- they share the same CyberArk Identity OAuth2 issuer
-$Global:Token = $null; $Global:TokenExpiry = Get-Date
-
-function Get-AuthToken {
-    $body = @{ grant_type="client_credentials"; client_id=$ServiceUserId; client_secret=$ServiceUserSecret }
-    try {
-        $r = Invoke-RestMethod -Uri "$IdentityUrl/oauth2/platformtoken" -Method POST -Body $body `
-            -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
-        $Global:Token = $r.access_token
-        $exp = if ($r.expires_in) { [int]$r.expires_in } else { 900 }
-        $Global:TokenExpiry = (Get-Date).AddSeconds($exp - 60)
-        Write-Log "Token acquired (valid ~${exp}s)." SUCCESS
-    } catch {
-        Write-Log "Authentication FAILED: $($_.Exception.Message)" ERROR
-        # `throw` (not `exit`) -- exiting would kill the whole Functions worker
-        # process; throwing fails just this invocation so the platform logs
-        # and (per its retry policy) can retry it on the next schedule.
-        throw "Cannot continue without a valid CyberArk token: $($_.Exception.Message)"
-    }
-}
-function Get-Headers {
-    if ((Get-Date) -ge $Global:TokenExpiry) { Write-Log "Refreshing token..." WARN; Get-AuthToken }
-    return @{ Authorization = "Bearer $Global:Token"; "Content-Type" = "application/json" }
-}
-
-# GET (Privilege Cloud)
-function Invoke-ApiGet {
-    param([string]$Uri)
-    $a = 0
-    while ($a -le $MaxRetries) {
-        $a++
-        try { return Invoke-RestMethod -Uri $Uri -Method GET -Headers (Get-Headers) -ErrorAction Stop }
-        catch {
-            $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-            $m = $_.Exception.Message
-            if ($s -in @(400,403,404,501)) { Write-Log "GET $Uri -> $s $m (no retry)" ERROR; return $null }
-            if ($s -eq 401) { Write-Log "401 - refreshing token" WARN; Get-AuthToken; continue }
-            if ($a -le $MaxRetries) {
-                $w = if ($s -eq 429) { $RetryWaitSeconds * $a } else { $RetryWaitSeconds }
-                Write-Log "GET $Uri -> $s $m (retry $a in ${w}s)" WARN; Start-Sleep -Seconds $w
-            } else { Write-Log "GET $Uri -> $s $m (exhausted)" ERROR; return $null }
-        }
-    }
-    return $null
-}
-function Get-AllPaged {
-    param([string]$BaseUri, [string]$ValueProp = "value")
-    $all = @(); $off = 0
-    do {
-        $sep = if ($BaseUri -match '\?') { '&' } else { '?' }
-        $resp = Invoke-ApiGet -Uri "$BaseUri${sep}limit=$PageLimit&offset=$off"
-        if (-not $resp) { break }
-        $batch = $resp.$ValueProp
-        if (-not $batch) { break }
-        $all += $batch; $off += $PageLimit
-        Write-Log "  ...$($all.Count) records" DEBUG
-    } while ($batch.Count -eq $PageLimit)
-    return $all
-}
-
-# GET (SCA)
-function Invoke-ScaGet {
-    param([string]$Uri)
-    $a = 0
-    while ($a -le $MaxRetries) {
-        $a++
-        try { return Invoke-RestMethod -Uri $Uri -Method GET -Headers (Get-Headers) -ErrorAction Stop }
-        catch {
-            $statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-            if ($statusCode -in @(400,401,403,404)) { Write-Log "GET $Uri -> $statusCode $($_.Exception.Message) (no retry)" ERROR; return $null }
-            if ($a -le $MaxRetries) {
-                Write-Log "GET $Uri -> $statusCode (retry $a in ${RetryWaitSeconds}s)" WARN
-                Start-Sleep -Seconds $RetryWaitSeconds
-            } else { Write-Log "GET $Uri -> $statusCode (exhausted)" ERROR; return $null }
-        }
-    }
-    return $null
-}
-
-# Timestamp converters & formatters
-function ConvertFrom-Unix { param($v)
-    if ($null -eq $v -or $v -eq 0 -or "$v" -eq "") { return $null }
-    try { return [DateTimeOffset]::FromUnixTimeSeconds([long]$v).LocalDateTime } catch { return $null }
-}
-function ConvertFrom-UnixMicro { param($v)
-    if ($null -eq $v -or $v -eq 0 -or "$v" -eq "") { return $null }
-    try { return [DateTimeOffset]::FromUnixTimeMilliseconds([long]([long]$v / 1000)).LocalDateTime } catch { return $null }
-}
-function Format-DateTime { param($dt) if ($dt) { return $dt.ToString("yyyy-MM-dd HH:mm:ss") } else { return "" } }
-function Format-DateOnly { param($dt) if ($dt) { return $dt.ToString("yyyy-MM-dd") } else { return "" } }
-function Format-MonthOnly { param($dt) if ($dt) { return $dt.ToString("yyyy-MM") } else { return "" } }
-function Safe-String { param($v, [string]$Default = "")
-    if ($null -eq $v -or [string]::IsNullOrWhiteSpace("$v")) { return $Default }; return "$v"
-}
-function Safe-DateString { param($v, [string]$Default = "")
-    if ($null -eq $v) { return $Default }
-    if ($v -is [DateTime]) { return $v.ToString("yyyy-MM-ddTHH:mm:ssZ") }
-    return Safe-String $v $Default
-}
-
-# ── Blob Storage (raw REST, Shared Key auth -- no Az.Storage module) ─────────
-# Flex Consumption doesn't support managed dependencies, so this signs requests
-# to the Azure Storage REST API itself using only built-in .NET crypto
-# (System.Security.Cryptography.HMACSHA256). This is the same Shared Key
-# signing algorithm the Az.Storage module would use internally -- just done
-# by hand so no external module needs to be installed.
-function Get-StorageAccountContext {
-    # PamDataStorage is a SEPARATE storage account from AzureWebJobsStorage
-    # (which the Function App still uses internally for its own bookkeeping) --
-    # output goes to its own dedicated account/containers instead of sharing
-    # the app's runtime storage. Expects the full connection string (as copied
-    # from the storage account's Access keys -> Connection string field).
-    $connStr = $env:PamDataStorage
-    if ([string]::IsNullOrWhiteSpace($connStr)) {
-        throw "PamDataStorage app setting is not configured -- cannot write output."
-    }
-    $parts = @{}
-    foreach ($seg in $connStr -split ';') {
-        if ($seg -match '^([^=]+)=(.*)$') { $parts[$matches[1]] = $matches[2] }
-    }
-    if (-not $parts.ContainsKey('AccountName') -or -not $parts.ContainsKey('AccountKey')) {
-        throw "PamDataStorage connection string is missing AccountName/AccountKey (unexpected format)."
-    }
-    return [pscustomobject]@{ AccountName = $parts['AccountName']; AccountKey = $parts['AccountKey'] }
-}
-
-function New-BlobCanonicalizedHeaders {
-    param([hashtable]$Headers)
-    # Spec requires lower-cased header names, sorted lexicographically.
-    ($Headers.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name.ToLowerInvariant()):$($_.Value)`n" }) -join ''
-}
-
-# Uploads (overwrites) one blob as UTF-8 text via the Blob Storage "Put Blob"
-# REST operation. $BlobPath is the blob name including any "/" prefixes, e.g.
-# "Latest/DIM_Region.csv" or "Archive/20260813_050000/DIM_Region.csv" -- Blob
-# Storage has no real folders, "/" in a blob name just displays like one.
-function Send-BlobText {
-    param(
-        [Parameter(Mandatory)][string]$Container,
-        [Parameter(Mandatory)][string]$BlobPath,
-        # AllowEmptyString: a Mandatory [string] parameter otherwise REJECTS ""
-        # outright ("Cannot bind argument... because it is an empty string") --
-        # a genuinely empty blob (e.g. a log with zero captured lines) is a
-        # valid case, not a caller error.
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
-        [string]$ContentType = "text/csv; charset=utf-8"
-    )
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Content)
-    $contentLength = $bytes.Length
-    $apiVersion = "2021-08-06"
-
-    $a = 0
-    while ($a -le $MaxRetries) {
-        $a++
-        $dateRfc1123 = [DateTime]::UtcNow.ToString("R")
-        $headers = @{
-            "x-ms-date"      = $dateRfc1123
-            "x-ms-version"   = $apiVersion
-            "x-ms-blob-type" = "BlockBlob"
-        }
-        $canonicalizedHeaders  = New-BlobCanonicalizedHeaders -Headers $headers
-        $canonicalizedResource = "/$($StorageContext.AccountName)/$Container/$BlobPath"
-
-        # Shared Key string-to-sign: VERB, then 11 rarely-used HTTP headers left
-        # blank (we authenticate via x-ms-date instead of Date, and don't use
-        # Content-Encoding/Language/MD5/If-*/Range here), then the canonicalized
-        # x-ms-* headers, then the canonicalized resource path.
-        $stringToSign = (@(
-            "PUT", "", "", "$contentLength", "", $ContentType, "", "", "", "", "", ""
-        ) -join "`n") + "`n$canonicalizedHeaders$canonicalizedResource"
-
-        $keyBytes = [Convert]::FromBase64String($StorageContext.AccountKey)
-        $hmac = New-Object System.Security.Cryptography.HMACSHA256
-        $hmac.Key = $keyBytes
-        $sigBytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))
-        $signature = [Convert]::ToBase64String($sigBytes)
-
-        $reqHeaders = @{
-            "x-ms-date"      = $dateRfc1123
-            "x-ms-version"   = $apiVersion
-            "x-ms-blob-type" = "BlockBlob"
-            "Authorization"  = "SharedKey $($StorageContext.AccountName):$signature"
-        }
-        $uri = "https://$($StorageContext.AccountName).blob.core.windows.net/$Container/$BlobPath"
-
+$moduleImported = $false
+foreach ($modulePath in $modulePaths) {
+    if (Test-Path $modulePath) {
         try {
-            Invoke-RestMethod -Uri $uri -Method PUT -Headers $reqHeaders -Body $bytes -ContentType $ContentType -ErrorAction Stop | Out-Null
-            return
-        } catch {
-            $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-            if ($a -le $MaxRetries) {
-                Write-Log "Blob PUT $Container/$BlobPath -> $s (retry $a in ${RetryWaitSeconds}s): $($_.Exception.Message)" WARN
-                Start-Sleep -Seconds $RetryWaitSeconds
-            } else {
-                Write-Log "Blob PUT $Container/$BlobPath -> $s FAILED (exhausted): $($_.Exception.Message)" ERROR
-                throw
-            }
+            Import-Module $modulePath -ErrorAction Stop -DisableNameChecking -Force
+            $moduleImported = $true
+            break
+        }
+        catch {
+            Write-Host "Failed to import module from $modulePath. Error: $_"
+            Write-Host "check that you copied the PS-Modules folder correctly."
+            Pause
+            Exit
         }
     }
 }
 
-# Creates a container if it doesn't already exist (idempotent -- a 409
-# "already exists" response is treated as success, not an error). Called once
-# per container during INITIALISE so a deleted/mistyped container name fails
-# fast with a clear message instead of every subsequent blob write 404'ing.
-function New-BlobContainerIfMissing {
-    param([Parameter(Mandatory)][string]$Container)
+if (-not $moduleImported) {
+    Write-Host "Could not find $mainModule under $ScriptLocation (or its parent folders)." -ForegroundColor Red
+    Write-Host "Make sure the PS-Modules folder from the Cyberark PrivilegeCloud Tools package is present alongside (or one/two levels above) this script." -ForegroundColor Red
+    Pause
+    Exit
+}
 
-    $apiVersion = "2021-08-06"
-    $dateRfc1123 = [DateTime]::UtcNow.ToString("R")
-    $headers = @{ "x-ms-date" = $dateRfc1123; "x-ms-version" = $apiVersion }
-    $canonicalizedHeaders  = New-BlobCanonicalizedHeaders -Headers $headers
-    $canonicalizedResource = "/$($StorageContext.AccountName)/$Container`nrestype:container"
+$global:LOG_FILE_PATH = "$ScriptLocation\_Get-UserTypesAndUsersLoginActivity.log"
 
-    $stringToSign = (@(
-        "PUT", "", "", "", "", "", "", "", "", "", "", ""
-    ) -join "`n") + "`n$canonicalizedHeaders$canonicalizedResource"
+[int]$scriptVersion = 10
 
-    $keyBytes = [Convert]::FromBase64String($StorageContext.AccountKey)
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256
-    $hmac.Key = $keyBytes
-    $sigBytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($stringToSign))
-    $signature = [Convert]::ToBase64String($sigBytes)
+# Track whether users with missing UserType were already handled/exported
+$script:MissingUserTypeHandled = $false
 
-    $reqHeaders = @{
-        "x-ms-date"     = $dateRfc1123
-        "x-ms-version"  = $apiVersion
-        "Authorization" = "SharedKey $($StorageContext.AccountName):$signature"
+# PS Window title
+$Host.UI.RawUI.WindowTitle = "Privilege Cloud License Capacity User Report"
+
+## Force Output to be UTF8 (for OS with different languages)
+try {
+    $OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
+}
+catch {
+    Write-Host "Note: Could not set console output encoding to UTF-8 (no valid console handle in this session, e.g. PSM/remote-brokered sessions). Continuing without changing encoding." -ForegroundColor Yellow
+}
+
+if ($ExportToCSV.IsPresent) {
+    $global:ExportDir = "$ScriptLocation\$(Get-Date -Format 'yyyyMMdd_HH-mm')"
+    if (!(Test-Path -Path $global:ExportDir)) {
+        New-Item -ItemType Directory -Path $global:ExportDir | Out-Null
     }
-    $uri = "https://$($StorageContext.AccountName).blob.core.windows.net/${Container}?restype=container"
+}
 
-    try {
-        Invoke-RestMethod -Uri $uri -Method PUT -Headers $reqHeaders -ErrorAction Stop | Out-Null
-        Write-Log "Container '$Container' did not exist -- created it." WARN
-    } catch {
-        $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-        if ($s -eq 409) {
-            # Already exists -- expected on every run after the first, not an error.
-            return
+function CalcLicenseInfo {
+    param(
+        [string]$licenseInfo
+    )
+
+    $formats = @(
+        "M/d/yyyy h:mm:ss tt",    # NA
+        "MM/dd/yyyy hh:mm:ss tt", # NA with leading zeros
+        "d/M/yyyy HH:mm:ss",      # EU STD without leading zeros
+        "dd/M/yyyy HH:mm:ss",     # EU STD with/without leading zeros
+        "dd/MM/yyyy HH:mm:ss",    # EU STD with leading zeros
+        "dd-MM-yyyy HH:mm:ss",    # India
+        "yyyy/MM/dd HH:mm:ss",    # East Asia (Japan, China, Korea)
+        "yyyy-MM-dd HH:mm:ss",    # ISO 8601
+        "dd.MM.yyyy HH:mm:ss",    # Central Europe
+        "d.M.yyyy H:mm:ss",       # Short format without leading zeros
+        "dd/MM/yyyy h:mm:ss tt",  # UK, Ireland, Australia
+        "MM-dd-yyyy HH:mm:ss",    # Philippines
+        "yyyyMMdd HH:mm:ss",      # Compact form
+        "d/M/yyyy h:mm:ss tt",    # Short format without leading zeros
+        "M-d-yyyy hh:mm:ss tt",   # Variations with dash separator
+        "d-M-yyyy HH:mm:ss",      # Variations with/without leading zeros and 24-hour format
+        "d/MM/yyyy h:mm tt",      # Without seconds
+        "M/dd/yyyy HH:mm:ss",     # Variations with/without leading zeros and 24-hour format
+        "MM/dd/yyyy H:mm:ss",     # Variations with leading zeros and 24-hour format
+        "d-M-yyyy hh:mm:ss tt",   # 12-hour format variations with/without leading zeros
+        "MM-d-yyyy hh:mm:ss tt",  # 12-hour format variations with leading zeros
+        "M.d.yyyy hh:mm:ss tt",   # Dot separator variations
+        "dd.MM.yyyy h:mm:ss tt",  # Dot separator variations with leading zeros
+        "MM.dd.yyyy HH:mm:ss",    # Dot separator variations with 24-hour format
+        "d.M.yyyy HH:mm:ss",      # 24-hour format variations with/without leading zeros
+        "yyyy.MM.dd HH:mm:ss",    # ISO variations with dot separator
+        "yyyy-MM.dd HH:mm:ss tt", # ISO variations with mixed separators
+        "yyyy/MM.dd hh:mm:ss tt"  # ISO variations with mixed separators and 12-hour format
+    )
+
+    $currentCulture = [System.Globalization.CultureInfo]::CurrentCulture
+
+    if ($currentCulture.TwoLetterISOLanguageName -like "en*") {
+        $provider = [System.Globalization.CultureInfo]::InvariantCulture
+    }
+    else {
+        $provider = $currentCulture
+    }
+
+    $parsedSuccessfully = $false
+    foreach ($format in $formats) {
+        try {
+            $licenseExpirationDate = [DateTime]::ParseExact($licenseInfo, $format, $provider)
+            $parsedSuccessfully = $true
+            break
         }
-        throw "Failed to ensure container '$Container' exists (HTTP $s): $($_.Exception.Message)"
+        catch {
+        }
+    }
+
+    if (-not $parsedSuccessfully) {
+        Write-Error "Failed to parse date: $licenseInfo"
+        return
+    }
+
+    $global:licenseExpirationDateLocal = $licenseExpirationDate.ToLocalTime()
+
+    $currentDate = Get-Date
+    $daysToExpiration = ($licenseExpirationDateLocal - $currentDate).Days
+
+    $global:lessThanXDays = ""
+    $global:Alertcolor = "Green"
+
+    if ($daysToExpiration -le 30) {
+        $global:Alertcolor = "Yellow"
+        $global:lessThanXDays = "Less than $daysToExpiration days remaining!"
+    }
+    if ($daysToExpiration -le 15) {
+        $global:Alertcolor = "Red"
+        $global:lessThanXDays = "Less than $daysToExpiration days remaining!"
     }
 }
 
+function Get-LicenseCapacityReport {
+    param(
+        [string]$vaultIp,
+        [string[]]$GetSpecificuserTypes
+    )
 
-# ==============================================================================
-# MODULE 3 : CLASSIFICATION & NAMING-CONVENTION FUNCTIONS
-# RAW safe/account date into Region/Tier/SafeType/Team/Environment/AccessType/SafePurpose tags (No API)
-# ==============================================================================
+    $VaultOperationFolderInside = "$PSScriptRoot\VaultOperationsTester"
+    $VaultOperationFolderOneUp = "$(Split-Path $PSScriptRoot)\VaultOperationsTester"
+    $VaultOperationFolderTwoUp = "$(Split-Path (Split-Path $PSScriptRoot))\VaultOperationsTester"
 
-function Test-IsDefaultSafe { param([string]$n)
-    if ($DefaultSafes -contains $n) { return $true }
-    foreach ($p in $DefaultSafePrefixes) { if ($n -like $p) { return $true } }; return $false
-}
-function Test-IsDefaultMember { param([string]$n)
-    foreach ($p in $DefaultMembersPatterns) { if ($n -like $p) { return $true } }; return $false
-}
-function Get-Region { param([string]$s)
-    # Match a region prefix only when it is followed by a delimiter (- _ space) or end-of-string,
-    # so "OTHER-..." is not mis-tagged as the "OT" region and "JPMORGAN-..." not as "JP".
-    foreach ($k in $RegionPrefixes.Keys) {
-        if ($s -match "^$([regex]::Escape($k))([-_ ]|$)") { return $RegionPrefixes[$k] }
+    if (Test-Path -Path "$VaultOperationFolderInside\VaultOperationsTester.exe") {
+        $VaultOperationFolder = $VaultOperationFolderInside
     }
-    return "Personal"
-}
-function Get-Tier { param([string]$s)
-    if ($s -match $TierRegex) { "T$($matches[2])" } else { "Untagged" }
-}
-function Get-SafeType { param([string]$s, [bool]$IsDefault)
-    if ($IsDefault) { return "System/Default" }
-    if ($s -match $PersonalAdminSuffixRegex) { return "Personal Admin" }
-    if ($s -match $SharedAdminSuffixRegex)   { return "Shared Admin" }
-    return "Standard Business"
-}
-function Get-SafeTier { param([string]$s, [string]$SafeType)
-    $t = Get-Tier $s
-    if ($t -eq "Untagged" -and $SafeType -eq "Personal Admin") { return $PersonalAdminTierLabel }
-    return $t
-}
-function Get-MappedToken { param([string]$Token, $Map)
-    # PowerShell's -eq is case-insensitive by default, so this matches "Prod"/"PROD"/"prod"
-    # equally against a single "PROD" key. Unmapped tokens are returned upper-cased (raw
-    # pass-through) so the same code always displays consistently regardless of source casing.
-    foreach ($k in $Map.Keys) { if ($k -eq $Token) { return $Map[$k] } }
-    return $Token.ToUpper()
-}
-function Test-TokenMapped { param([string]$Token, $Map)
-    foreach ($k in $Map.Keys) { if ($k -eq $Token) { return $true } }
-    return $false
-}
-function Get-SafePurpose { param([string]$s)
-    # Strip a trailing tier/admin suffix FIRST so the purpose keyword underneath is visible —
-    # e.g. "APAC-PROD-WIN-RECONCILE-T0" ends in "-T0", not "-RECONCILE", until this runs.
-    $core = $s -replace $SharedAdminSuffixRegex, '' -replace $PersonalAdminSuffixRegex, ''
-    foreach ($suf in $SafePurposeSuffixes.Keys) {
-        if ($core -match ('-' + $suf + '$')) { return $SafePurposeSuffixes[$suf] }
+    elseif (Test-Path -Path "$VaultOperationFolderOneUp\VaultOperationsTester.exe") {
+        $VaultOperationFolder = $VaultOperationFolderOneUp
     }
-    return "Standard"
-}
-# Region-Env-Technology-AccessType-Team, parsed via token array (not regex) because the
-# tail is variable-length in real data: AccessType and/or Team can be ENTIRELY ABSENT (a
-# generic per-tier admin safe like "APAC-P-WIN-LA-T0" has no team code at all), and a
-# purpose keyword (LOGON/SCAN/RECONCILE) can sit where AccessType would normally be
-# ("APAC-PROD-WIN-RECONCILE-T0" — RECONCILE IS the 4th token, not a suffix after it).
-function Get-SafeTeamTag { param([string]$s, [string]$SafeType)
-    if ($SafeType -eq "System/Default") {
-        return [pscustomobject]@{ Environment="N/A (Default)"; NamingTechnology="N/A (Default)"; AccessType="N/A (Default)"; Team="N/A (Default)"; TeamName="N/A (Default)" }
+    elseif (Test-Path -Path "$VaultOperationFolderTwoUp\VaultOperationsTester.exe") {
+        $VaultOperationFolder = $VaultOperationFolderTwoUp
     }
-    $core = $s
-    if ($SafeType -eq "Shared Admin")        { $core = $core -replace $SharedAdminSuffixRegex, '' }
-    elseif ($SafeType -eq "Personal Admin")  { $core = $core -replace $PersonalAdminSuffixRegex, '' }
+    else {
+        Write-Host "Required file 'VaultOperationsTester.exe' doesn't exist in expected folders: `n- `"$VaultOperationFolderInside`" `n- `"$VaultOperationFolderOneUp`" `n- `"$VaultOperationFolderTwoUp`". Make sure you get the latest version and extract it correctly from zip." -ForegroundColor Red
+        Pause
+        return
+    }
 
-    $tokens = @($core -split '-')
-    $isValidRegion = $false
-    foreach ($rk in $RegionPrefixes.Keys) { if ($rk -eq $tokens[0]) { $isValidRegion = $true; break } }
+    $stdoutFile = "$VaultOperationFolder\Log\stdout.log"
+    $LOG_FILE_PATH_CasosArchive = "$VaultOperationFolder\Log\old"
+    $specificUserTypesString = $GetSpecificuserTypes -join ','
 
-    # Environment/Technology/AccessType come from CLOSED code lists — unlike Team, which
-    # is intentionally open-ended. A match is only accepted when Env/Technology are
-    # recognised (and AccessType too, when present); otherwise this isn't really a
-    # naming-convention name, just a region-prefixed string with enough dashes.
-    $envTokCandidate  = if ($tokens.Count -ge 2) { $tokens[1] } else { $null }
-    $techTokCandidate = if ($tokens.Count -ge 3) { $tokens[2] } else { $null }
-    $envOk  = $envTokCandidate  -and (Test-TokenMapped $envTokCandidate  $EnvironmentTokens)
-    $techOk = $techTokCandidate -and (Test-TokenMapped $techTokCandidate $TechnologyTokens)
+    $redistributables = @(
+        @{ Name = "Microsoft Visual C++ 2022 X86*"; Path = "$VaultOperationFolder\vc_redist.x86.exe" },
+        @{ Name = "Microsoft Visual C++ 2022 X64*"; Path = "$VaultOperationFolder\vc_redist.x64.exe" }
+    )
 
-    if ($tokens.Count -ge 3 -and $isValidRegion -and $envOk -and $techOk) {
-        $envTok  = $tokens[1]
-        $techTok = $tokens[2]
-        $rest = @(if ($tokens.Count -gt 3) { $tokens[3..($tokens.Count-1)] })
+    foreach ($redis in $redistributables) {
+        if ((Get-CimInstance -Class win32_product | Where-Object { $_.Name -like $redis.Name }) -eq $null) {
+            Write-LogMessage -type Info -MSG "Installing Redis++ from $($redis.Path)..." -Early
+            Start-Process -FilePath $redis.Path -ArgumentList "/install /passive /norestart" -Wait
+        }
+    }
 
-        # A trailing purpose keyword (LOGON/SCAN/RECONCILE) is not part of AccessType/Team.
-        if ($rest.Count -gt 0) {
-            $lastRest = $rest[-1]
-            foreach ($suf in $SafePurposeSuffixes.Keys) {
-                if ($lastRest -eq $suf) {
-                    $rest = @(if ($rest.Count -gt 1) { $rest[0..($rest.Count-2)] })
-                    break
+    if (Test-Path $LOG_FILE_PATH_CasosArchive) {
+        if (Get-ChildItem $LOG_FILE_PATH_CasosArchive | Measure-Object -Property length -Sum | Where-Object { $_.sum -gt 5MB }) {
+            Write-Host "Archive log folder is getting too big, deleting it." -ForegroundColor Gray
+            Write-Host "Deleting $LOG_FILE_PATH_CasosArchive" -ForegroundColor Gray
+            Remove-Item $LOG_FILE_PATH_CasosArchive -Recurse -Force
+        }
+    }
+
+    New-Item -Path $stdoutFile -Force | Out-Null
+
+    $process = Start-Process -FilePath "$VaultOperationFolder\VaultOperationsTester.exe" -ArgumentList "$($Credentials.UserName) $($Credentials.GetNetworkCredential().Password) $VaultIP GetLicense $specificUserTypesString" -WorkingDirectory "$VaultOperationFolder" -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdoutFile
+    $stdout = (Get-Content $stdoutFile)
+
+    if ($process.ExitCode -ne 0) {
+        Write-Host "-----------------------------------------"
+        $stdout | Select-String -Pattern 'Extra details' -NotMatch | Write-Host -ForegroundColor Red
+        Write-Host "$($stdout | Select-String -Pattern 'Extra details')" -ForegroundColor Red
+        Write-Host "Failed" -ForegroundColor Red
+        Write-Host "-----------------------------------------"
+        Write-Host "More detailed log can be found here: $VaultOperationFolder\Log\Casos.Error.log"
+    }
+    else {
+        $usersInfo = @()
+        $currentUserInfo = $null
+
+        foreach ($line in $stdout) {
+            $trimmedLine = $line.Trim()
+
+            if ($trimmedLine -eq "Connecting to the vault...") {
+                $currentUserInfo = @{
+                    "Name" = $null
+                    "UserType Description" = $null
+                    "Licensed Users" = $null
+                    "Existing Users" = $null
+                    "Currently Logged On Users" = $null
                 }
             }
-        }
-
-        $accessTok = if ($rest.Count -ge 1) { $rest[0] } else { $null }
-        if ($accessTok -and -not (Test-TokenMapped $accessTok $AccessTypeTokens)) {
-            return [pscustomobject]@{ Environment="Unknown"; NamingTechnology="Unknown"; AccessType="Unknown"; Team="Not Tagged"; TeamName="Not Tagged" }
-        }
-        $teamParts = @(if ($rest.Count -ge 2) { $rest[1..($rest.Count-1)] })
-        $team = if ($teamParts.Count -gt 0) { [string]$teamParts[-1] } else { "N/A (Not Present)" }
-        if ($team -ne "N/A (Not Present)") { $team = $team.ToUpper() }
-
-        return [pscustomobject]@{
-            Environment      = Get-MappedToken $envTok  $EnvironmentTokens
-            NamingTechnology = Get-MappedToken $techTok $TechnologyTokens
-            AccessType       = if ($accessTok) { Get-MappedToken $accessTok $AccessTypeTokens } else { "N/A (Not Present)" }
-            Team             = $team
-            TeamName         = if ($team -eq "N/A (Not Present)") { $team } else { Get-MappedToken $team $TeamCodeMap }
-        }
-    }
-    return [pscustomobject]@{ Environment="Unknown"; NamingTechnology="Unknown"; AccessType="Unknown"; Team="Not Tagged"; TeamName="Not Tagged" }
-}
-function Get-OSCategory { param([string]$p)
-    foreach ($x in $WindowsPlatformPatterns)  { if ($p -like $x) { return "Windows" } }
-    foreach ($x in $UnixPlatformPatterns)     { if ($p -like $x) { return "Unix/Linux" } }
-    foreach ($x in $DatabasePlatformPatterns) { if ($p -like $x) { return "Database" } }
-    foreach ($x in $CloudPlatformPatterns)    { if ($p -like $x) { return "Cloud" } }
-    foreach ($x in $NetworkPlatformPatterns)  { if ($p -like $x) { return "Network" } }
-    return "Other"
-}
-function Get-RotationDays { param([string]$p)
-    foreach ($k in $RotationPolicyDays.Keys) { if ($p -like $k) { return $RotationPolicyDays[$k] } }
-    return $DefaultRotationDays
-}
-function Test-SafeNaming { param([string]$s)
-    if ([string]::IsNullOrWhiteSpace($SafeNameExpectedRegex)) { return $true }
-    if ($s -match $SafeNameExpectedRegex)     { return $true }
-    if ($s -match $PersonalAdminSuffixRegex)  { return $true }
-    if ($s -match $SharedAdminSuffixRegex)    { return $true }
-    return $false
-}
-function Test-AccountNaming { param([string]$n)
-    if ([string]::IsNullOrWhiteSpace($AccountNameExpectedRegex)) { return $true }
-    return ($n -match $AccountNameExpectedRegex)
-}
-function Test-AccountAddress { param([string]$a)
-    if ([string]::IsNullOrWhiteSpace($AccountAddressExpectedRegex)) { return $true }
-    return ($a -match $AccountAddressExpectedRegex)
-}
-
-#  ===============================================================================
-#  INITIALISE
-#  ===============================================================================
-# $StorageContext is acquired OUTSIDE the try/finally below: if PamDataStorage
-# itself is missing/malformed, there is no way to upload a log blob anyway (the
-# very thing that would upload it needs this context) -- that one failure mode
-# is only visible in Application Insights, not the Logs container.
-$StorageContext  = Get-StorageAccountContext
-
-# Ensure all three containers exist before anything else runs -- self-heals a
-# deleted/never-created container, and fails fast with a clear message rather
-# than every subsequent blob write 404'ing partway through the run.
-foreach ($c in @($LatestContainer, $ArchiveContainer, $LogsContainer)) {
-    New-BlobContainerIfMissing -Container $c
-}
-
-# Accumulates every Write-Log line so the whole run's log can be uploaded as
-# ONE blob to the Logs container at the end -- inside a try/finally so this
-# still happens even if the run fails partway through (exactly the runs you
-# most want a log for).
-$LogLines = [System.Collections.Generic.List[string]]::new()
-
-try {
-
-$ScriptStartTime = Get-Date
-$ExtractDate     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-$RunErrors       = [System.Collections.Generic.List[string]]::new()
-$RecordCounts    = [ordered]@{}
-
-Write-Log "═══════════════════════════════════════════════════════════" SECTION
-Write-Log " CyberArk Dashboard (PAM + SCA) — Azure Function" SECTION
-Write-Log "═══════════════════════════════════════════════════════════" SECTION
-Write-Log "Extract Date : $ExtractDate" INFO
-Write-Log "Output       : $LatestContainer (+ $ArchiveContainer/$ArchivePathPrefix, $LogsContainer/$RunTimestamp.log)" INFO
-
-#  ===============================================================================
-#  AUTHENTICATE
-#  ===============================================================================
-Write-Log "=== Authenticate ===" SECTION
-Get-AuthToken
-
-# ===============================================================================
-#  MODULE 4 : PAM DATA COLLECTION (Privilege Cloud)
-#  Creates - DIM_Safe, FACT_Users, FACT_Accounts, FACT_VaultConnectivity, FACT_OnboardingTrend, DIM_Region
-# ===============================================================================
-
-# ── 4.1 Safes → DIM_Safe ──────────────────────────────────────────────────────
-Write-Log "=== 4.1: Collecting Safes ===" SECTION
-$SafesRaw = Get-AllPaged -BaseUri "$PvwaBase/Safes" -ValueProp "value"
-
-$DimSafe = @(foreach ($s in $SafesRaw) {
-    $def = Test-IsDefaultSafe $s.safeName
-    $created = ConvertFrom-Unix $s.creationTime
-    $lastMod = ConvertFrom-UnixMicro $s.lastModificationTime
-    $namingOk = if ($def) { $true } else { Test-SafeNaming $s.safeName }
-    $safeType = Get-SafeType $s.safeName $def
-    $teamTag  = Get-SafeTeamTag $s.safeName $safeType
-    [pscustomobject]@{
-        SafeName      = $s.safeName
-        SafeUrlId     = $s.safeUrlId
-        SafeNumber    = $s.safeNumber
-        Description   = Safe-String $s.description
-        Location      = Safe-String $s.location
-        Creator       = Safe-String $s.creator.name
-        ManagingCPM   = Safe-String $s.managingCPM
-        NumberOfAccounts = [int]$s.numberOfAccounts
-        OLACEnabled   = $s.olacEnabled
-        AutoPurge     = $s.autoPurgeEnabled
-        RetentionVersions = $s.numberOfVersionsRetention
-        RetentionDays = $s.numberOfDaysRetention
-        CreatedDate   = Format-DateOnly $created
-        CreatedDateTime = Format-DateTime $created
-        LastModifiedDateTime = Format-DateTime $lastMod
-        IsDefault     = $def
-        SafeType      = $safeType
-        Region        = if ($def) { "N/A-Default" } else { Get-Region $s.safeName }
-        Tier          = if ($def) { "N/A-Default" } else { Get-SafeTier $s.safeName $safeType }
-        Environment   = $teamTag.Environment
-        NamingTechnology = $teamTag.NamingTechnology
-        AccessType    = $teamTag.AccessType
-        Team          = $teamTag.Team
-        TeamName      = $teamTag.TeamName
-        SafePurpose   = Get-SafePurpose $s.safeName
-        HasCPM        = -not [string]::IsNullOrWhiteSpace($s.managingCPM)
-        IsEmpty       = ([int]$s.numberOfAccounts -eq 0)   # corrected below in 4.3
-        RecentlyCreated = ($created -and (New-TimeSpan -Start $created -End (Get-Date)).Days -le $OnboardingWindowDays)
-        NamingCompliant = $namingOk
-        ExtractDate   = $ExtractDate
-    }
-})
-
-$SafeLookup = @{}; foreach ($f in $DimSafe) { $SafeLookup[$f.SafeName] = $f }
-$bizSafes = @($DimSafe | Where-Object { -not $_.IsDefault })
-Write-Log "Safes: total=$($SafesRaw.Count) business=$($bizSafes.Count) default=$($DimSafe.Count - $bizSafes.Count)" SUCCESS
-$RecordCounts["DIM_Safe"] = $DimSafe.Count
-
-# ── 4.2 Users → FACT_Users ────────────────────────────────────────────────────
-Write-Log "=== 4.2: Collecting Users ===" SECTION
-$UsersResp = Invoke-ApiGet -Uri "$PvwaBase/Users?ExtendedDetails=True"
-$UsersRaw  = if ($UsersResp.Users) { $UsersResp.Users } else { @() }
-
-$FactUsers = @(foreach ($u in $UsersRaw) {
-    $isComp = ($u.componentUser -eq $true) -or (Test-IsDefaultMember $u.username) -or ($u.userType -ne "EPVUser")
-    $lastLogin = ConvertFrom-Unix $u.lastSuccessfulLoginDate
-    $days = if ($lastLogin) { (New-TimeSpan -Start $lastLogin -End (Get-Date)).Days } else { $null }
-    [pscustomobject]@{
-        UserName       = $u.username
-        UserID         = $u.id
-        Source         = Safe-String $u.source
-        UserType       = $u.userType
-        ComponentUser  = $u.componentUser
-        IsComponent    = $isComp
-        Enabled        = $u.enableUser
-        Suspended      = $u.suspended
-        Location       = Safe-String $u.location
-        FirstName      = Safe-String $u.personalDetails.firstName
-        LastName       = Safe-String $u.personalDetails.lastName
-        Email          = Safe-String $u.internet.businessEmail
-        VaultAuth      = (($u.vaultAuthorization) -join "; ")
-        PasswordNeverExpires = $u.passwordNeverExpires
-        LastLoginDate  = Format-DateOnly $lastLogin
-        LastLoginDateTime = Format-DateTime $lastLogin
-        DaysSinceLogin = $days
-        LoginStatus    = if (-not $lastLogin) { "Never Logged In" }
-                         elseif ($days -le $LoginWindowDays) { "Active (<= $LoginWindowDays d)" }
-                         else { "Dormant (> $LoginWindowDays d)" }
-        ExtractDate    = $ExtractDate
-    }
-})
-
-$realUsers = @($FactUsers | Where-Object { -not $_.IsComponent })
-Write-Log "Users: total=$($UsersRaw.Count) real=$($realUsers.Count) active=$(@($realUsers | Where-Object { $_.LoginStatus -like 'Active*' }).Count)" SUCCESS
-$RecordCounts["FACT_Users"] = $FactUsers.Count
-
-# ── 4.3 Accounts → FACT_Accounts ──────────────────────────────────────────────
-Write-Log "=== 4.3: Collecting Accounts ===" SECTION
-$AcctRaw = Get-AllPaged -BaseUri "$PvwaBase/Accounts" -ValueProp "value"
-
-$FactAccounts = @(foreach ($a in $AcctRaw) {
-    $sfi      = $SafeLookup[$a.safeName]
-    $defSafe  = if ($sfi) { $sfi.IsDefault } else { Test-IsDefaultSafe $a.safeName }
-    $sm       = $a.secretManagement
-    $auto     = ($sm.automaticManagementEnabled -eq $true)
-    $lastChg  = ConvertFrom-Unix $sm.lastModifiedTime
-    $lastVer  = ConvertFrom-Unix $sm.lastVerifiedTime
-    $lastRec  = ConvertFrom-Unix $sm.lastReconciledTime
-    $created  = ConvertFrom-Unix $a.createdTime
-    $dChg     = if ($lastChg) { (New-TimeSpan -Start $lastChg -End (Get-Date)).Days } else { $null }
-    $dVer     = if ($lastVer) { (New-TimeSpan -Start $lastVer -End (Get-Date)).Days } else { $null }
-    $dAge     = if ($created) { (New-TimeSpan -Start $created -End (Get-Date)).Days } else { $null }
-    $rot      = Get-RotationDays $a.platformId
-    $cpmStat  = Safe-String $sm.status
-    $comp     = switch ($cpmStat) { "success" { "Compliant" } "failure" { "Non-Compliant" } default { "Pending/Unknown" } }
-    $safeType = if ($sfi) { $sfi.SafeType } else { Get-SafeType $a.safeName $defSafe }
-    $region   = if ($sfi) { $sfi.Region } else { Get-Region $a.safeName }
-    $tier     = if ($sfi) { $sfi.Tier }   else { Get-SafeTier $a.safeName $safeType }
-    $teamTag  = if ($sfi) { [pscustomobject]@{ Environment=$sfi.Environment; NamingTechnology=$sfi.NamingTechnology; AccessType=$sfi.AccessType; Team=$sfi.Team; TeamName=$sfi.TeamName } } else { Get-SafeTeamTag $a.safeName $safeType }
-    $safePurpose = if ($sfi) { $sfi.SafePurpose } else { Get-SafePurpose $a.safeName }
-    $platId   = Safe-String $a.platformId "Unknown"
-    $nameOk   = Test-AccountNaming (Safe-String $a.name)
-    $addrOk   = Test-AccountAddress (Safe-String $a.address)
-
-    [pscustomobject]@{
-        AccountID         = Safe-String $a.id
-        Name              = Safe-String $a.name
-        UserName          = Safe-String $a.userName
-        Address           = Safe-String $a.address
-        SafeName          = Safe-String $a.safeName
-        PlatformID        = $platId
-        SecretType        = Safe-String $a.secretType
-        IsDefaultSafe     = $defSafe
-        SafeType          = $safeType
-        Region            = $region
-        Tier              = $tier
-        Environment       = $teamTag.Environment
-        NamingTechnology  = $teamTag.NamingTechnology
-        AccessType        = $teamTag.AccessType
-        Team              = $teamTag.Team
-        TeamName          = $teamTag.TeamName
-        SafePurpose       = $safePurpose
-        OSCategory        = Get-OSCategory $platId
-        AutoManaged       = $auto
-        MgmtTechnique     = if ($auto) { "Automatic (APM)" } else { "Manual (MPM)" }
-        ManualReason      = Safe-String $sm.manualManagementReason
-        ComplianceStatus  = $comp
-        SecretStatus      = $cpmStat
-        LastChangeDate    = Format-DateOnly $lastChg
-        LastChangeDateTime = Format-DateTime $lastChg
-        DaysSinceChange   = $dChg
-        ExpectedRotationDays = $rot
-        RotationOverdue   = if ($null -ne $dChg) { $dChg -gt $rot } else { $false }
-        LastVerifyDate    = Format-DateOnly $lastVer
-        DaysSinceVerify   = $dVer
-        VerifyStatus      = if (-not $auto) { "N/A (Manual)" }
-                            elseif (-not $lastVer) { "Never Verified" }
-                            elseif ($dVer -gt $VerifyOverdueDays) { "Overdue (> $VerifyOverdueDays d)" }
-                            else { "Verified" }
-        LastReconciledDate = Format-DateOnly $lastRec
-        IsStale           = if ($null -ne $dChg) { $dChg -ge $StaleAccountDays } else { $false }
-        CreatedDate       = Format-DateOnly $created
-        CreatedMonth      = Format-MonthOnly $created
-        AccountAgeDays    = $dAge
-        RecentlyOnboarded = ($created -and (New-TimeSpan -Start $created -End (Get-Date)).Days -le $OnboardingWindowDays)
-        NameCompliant     = $nameOk
-        AddressCompliant  = $addrOk
-        HasAddress        = -not [string]::IsNullOrWhiteSpace($a.address)
-        ExtractDate       = $ExtractDate
-    }
-})
-
-$biz = @($FactAccounts | Where-Object { -not $_.IsDefaultSafe })
-Write-Log "Accounts: total=$($AcctRaw.Count) business=$($biz.Count)" SUCCESS
-$RecordCounts["FACT_Accounts"] = $FactAccounts.Count
-
-
-$acctCountBySafe = @{}
-foreach ($fa in $FactAccounts) {
-    if (-not $acctCountBySafe.ContainsKey($fa.SafeName)) { $acctCountBySafe[$fa.SafeName] = 0 }
-    $acctCountBySafe[$fa.SafeName]++
-}
-foreach ($sf in $DimSafe) {
-    $realCount = if ($acctCountBySafe.ContainsKey($sf.SafeName)) { $acctCountBySafe[$sf.SafeName] } else { 0 }
-    $sf.NumberOfAccounts = $realCount
-    $sf.IsEmpty = ($realCount -eq 0)
-}
-
-# Personal Admin safes only got the "Personal/All-Tiers" placeholder Tier above
-# (their SAFE name has no T0/T1/T2 in it). If any account inside one of them has
-# a PlatformID ending in a real tier suffix (e.g. "...-T1"), use that instead --
-# corrected in place on both DIM_Safe and FACT_Accounts, same pattern as the
-# NumberOfAccounts/IsEmpty fix above. Safes with no such account keep the
-# placeholder unchanged.
-$personalAdminSafes = @($DimSafe | Where-Object { $_.SafeType -eq "Personal Admin" -and $_.Tier -eq $PersonalAdminTierLabel })
-if ($personalAdminSafes.Count -gt 0) {
-    $acctsBySafeName = @{}
-    foreach ($fa in $FactAccounts) {
-        if (-not $acctsBySafeName.ContainsKey($fa.SafeName)) { $acctsBySafeName[$fa.SafeName] = [System.Collections.Generic.List[object]]::new() }
-        $acctsBySafeName[$fa.SafeName].Add($fa)
-    }
-    foreach ($sf in $personalAdminSafes) {
-        if (-not $acctsBySafeName.ContainsKey($sf.SafeName)) { continue }
-        $platformTier = $null
-        foreach ($acct in $acctsBySafeName[$sf.SafeName]) {
-            if ($acct.PlatformID -match $PersonalAdminPlatformTierRegex) { $platformTier = "T$($matches[1])"; break }
-        }
-        if ($platformTier) {
-            $sf.Tier = $platformTier
-            foreach ($acct in $acctsBySafeName[$sf.SafeName]) { $acct.Tier = $platformTier }
-        }
-    }
-}
-
-# ── 4.4 Vault Connectivity → FACT_VaultConnectivity ──────────────────────────
-Write-Log "=== 4.4: Fetching Vault Connectivity ===" SECTION
-$VaultRows = [System.Collections.Generic.List[PSCustomObject]]::new()
-foreach ($compType in $VaultComponentIDs) {
-    try {
-        $vResp = Invoke-ApiGet -Uri "$PvwaBase/ComponentsMonitoringDetails/$compType/"
-        if ($null -ne $vResp -and $null -ne $vResp.ComponentsDetails) {
-            foreach ($d in $vResp.ComponentsDetails) {
-                $VaultRows.Add([pscustomobject]@{
-                    ComponentType    = $compType
-                    InstanceIP       = Safe-String $d.ComponentIP
-                    VaultUserName    = Safe-String $d.ComponentUserName
-                    ComponentVersion = Safe-String $d.ComponentVersion
-                    IsLoggedOn       = if ($d.IsLoggedOn -eq $true) { "TRUE" } else { "FALSE" }
-                    LastLogonDate    = Format-DateTime (ConvertFrom-Unix $d.LastLogonDate)
-                    ExtractDate      = $ExtractDate
-                })
+            elseif ($trimmedLine.StartsWith("Name: ")) {
+                $currentUserInfo["Name"] = $trimmedLine -replace "Name: "
             }
-            Write-Log "  $compType instances: $($vResp.ComponentsDetails.Count)" INFO
+            elseif ($trimmedLine.StartsWith("UserType Description: ")) {
+                $currentUserInfo["UserType Description"] = $trimmedLine -replace "UserType Description: "
+            }
+            elseif ($trimmedLine.StartsWith("Licensed Users: ")) {
+                $currentUserInfo["Licensed Users"] = $trimmedLine -replace "Licensed Users: "
+            }
+            elseif ($trimmedLine.StartsWith("Existing Users: ")) {
+                $currentUserInfo["Existing Users"] = $trimmedLine -replace "Existing Users: "
+            }
+            elseif ($trimmedLine.StartsWith("Currently Logged On Users: ")) {
+                $currentUserInfo["Currently Logged On Users"] = $trimmedLine -replace "Currently Logged On Users: "
+                $usersInfo += New-Object PSObject -Property $currentUserInfo
+            }
+            elseif ($trimmedLine.StartsWith("License Expiration Date: ")) {
+                $licenseInfo = $trimmedLine -replace "License Expiration Date: "
+            }
         }
-    } catch {
-        Write-Log "Failed vault details for ${compType}: $($_.Exception.Message)" ERROR
-        $RunErrors.Add("VaultConnectivity ($compType): $($_.Exception.Message)")
-    }
-}
-Write-Log "Vault connectivity records: $($VaultRows.Count)" SUCCESS
-$RecordCounts["FACT_VaultConnectivity"] = $VaultRows.Count
 
-# ── 4.5 Onboarding Trend → FACT_OnboardingTrend ──────────────────────────────
-Write-Log "=== 4.5: Building Onboarding Trend Table ===" SECTION
-$trendCutoff = [datetime]::new((Get-Date).AddMonths(-1 * $TrendLookbackMonths).Year, (Get-Date).AddMonths(-1 * $TrendLookbackMonths).Month, 1)
+        CalcLicenseInfo -licenseInfo $licenseInfo
+        Write-Host "License Expiration Date: $licenseExpirationDateLocal $lessThanXDays" -ForegroundColor $Alertcolor
+        $usersInfo | Select-Object Name, "UserType Description", "Licensed Users", "Existing Users", "Currently Logged On Users" | Format-Table -AutoSize | Out-Host
+        Write-Host "-------------------------------------------------------------"
 
-$acctTrend = $biz | Where-Object { $_.CreatedMonth -and ([datetime]::ParseExact("$($_.CreatedMonth)-01","yyyy-MM-dd",$null) -ge $trendCutoff) } |
-    Group-Object CreatedMonth | Sort-Object Name
-$safeTrend = $bizSafes | Where-Object { $_.CreatedDate -and ([datetime]$_.CreatedDate -ge $trendCutoff) } |
-    ForEach-Object { [pscustomobject]@{ Month = ([datetime]$_.CreatedDate).ToString("yyyy-MM") } } |
-    Group-Object Month | Sort-Object Name
+        if (-not $ExportToCSV.IsPresent) {
+            $ExportCSVChoice = Get-Choice -Title "Export Results to CSV" -Options "Yes","No" -DefaultChoice 2
 
-$TrendRows = [System.Collections.Generic.List[PSCustomObject]]::new()
-$mStart = $trendCutoff
-while ($mStart -le (Get-Date)) {
-    $mKey = $mStart.ToString("yyyy-MM")
-    $acctCount = 0; $safeCount = 0
-    $ag = $acctTrend | Where-Object { $_.Name -eq $mKey }; if ($ag) { $acctCount = $ag.Count }
-    $sg = $safeTrend | Where-Object { $_.Name -eq $mKey }; if ($sg) { $safeCount = $sg.Count }
-    $TrendRows.Add([pscustomobject]@{
-        Month = $mKey; Year = $mStart.Year; MonthNumber = $mStart.Month; MonthName = $mStart.ToString("MMM")
-        AccountsOnboarded = $acctCount; SafesCreated = $safeCount; ExtractDate = $ExtractDate
-    })
-    $mStart = $mStart.AddMonths(1)
-}
-Write-Log "Onboarding trend rows: $($TrendRows.Count)" SUCCESS
-$RecordCounts["FACT_OnboardingTrend"] = $TrendRows.Count
+            if ($ExportCSVChoice -eq "Yes") {
+                $csvFilePath = "$ExportDir\LicenseCapacityReport.csv"
+                $usersInfo | Select-Object Name, "UserType Description", "Licensed Users", "Existing Users", "Currently Logged On Users" | Export-Csv -Path $csvFilePath -NoTypeInformation -Force
+                Write-Host "Results exported to $csvFilePath" -ForegroundColor Cyan
 
-# ── 4.6 Dimension: DIM_Region ─────────────────────────────────────────────────
-Write-Log "=== 4.6: Generating DIM_Region ===" SECTION
-$DimRegion = [System.Collections.Generic.List[PSCustomObject]]::new()
-$seenRegions = @{}
-foreach ($k in $RegionPrefixes.Keys) {
-    $rn = $RegionPrefixes[$k]
-    if (-not $seenRegions.ContainsKey($rn)) {
-        $seenRegions[$rn] = $true
-        $prefixes = @($RegionPrefixes.Keys | Where-Object { $RegionPrefixes[$_] -eq $rn }) -join ", "
-        $DimRegion.Add([pscustomobject]@{ RegionKey=$rn; RegionName=$rn; Prefixes=$prefixes })
-    }
-}
-$DimRegion.Add([pscustomobject]@{ RegionKey="Personal"; RegionName="Personal"; Prefixes="" })
-$DimRegion.Add([pscustomobject]@{ RegionKey="N/A-Default"; RegionName="N/A-Default"; Prefixes="" })
-$RecordCounts["DIM_Region"] = $DimRegion.Count
-
-# ==============================================================================
-# MODULE 5 : SCA DATA COLLECTION (Secure Cloud Access)
-# Creates : SCA_Policies — every field the /policies API returns fields
-# ==============================================================================
-Write-Log "=== 5.1: Collecting SCA Access Policies ===" SECTION
-$policiesResp = Invoke-ScaGet -Uri "$ScaBase/policies"
-$policyHits = @($policiesResp.hits)
-
-
-if ($policiesResp -and $policiesResp.total -gt $policyHits.Count) {
-    Write-Log "WARNING: SCA /policies reports total=$($policiesResp.total) but only $($policyHits.Count) hits returned. This export may be INCOMPLETE." WARN
-}
-if ($policiesResp -and $policiesResp.PSObject.Properties.Name -contains "last_evaluated_key" -and $policiesResp.last_evaluated_key) {
-    Write-Log "WARNING: SCA /policies response includes a populated 'last_evaluated_key' -- a second page likely exists. This export may be INCOMPLETE." WARN
-}
-
-$ScaPolicies = @(foreach ($p in $policyHits) {
-    $statusCode = [int]$p.status
-    $cloudCode  = [int]$p.cloudProvider
-    $entities     = @($p.entities)
-    $userEntities = @($entities | Where-Object { $_.entityType -eq 1 })
-    $roleEntities = @($entities | Where-Object { $_.entityType -eq 0 })
-    [pscustomobject]@{
-        PolicyId               = Safe-String $p.policyId
-        Name                   = Safe-String $p.name
-        Description            = Safe-String $p.description
-        Status                 = $statusCode
-        StatusLabel            = if ($PolicyStatusMap.ContainsKey($statusCode)) { $PolicyStatusMap[$statusCode] } else { "Unknown ($statusCode)" }
-
-        PrimaryStatus          = Safe-String $p.primaryStatus
-        CloudProvider          = $cloudCode
-        CloudProviderLabel     = if ($CloudProviderMap.ContainsKey($cloudCode)) { $CloudProviderMap[$cloudCode] } else { "Unknown ($cloudCode)" }
-        CreationDate           = Safe-DateString $p.creationDate
-        LastChanged            = Safe-DateString $p.lastChanged
-        StartDate              = Safe-DateString $p.startDate
-        ExpirationDate         = Safe-DateString $p.expirationDate
-        MaxSessionDurationHours = if ($p.accessRules -and $p.accessRules.maxSessionDuration) { $p.accessRules.maxSessionDuration } else { $null }
-        UserEntityCount        = $userEntities.Count
-        RoleEntityCount        = $roleEntities.Count
-        FaultCode              = Safe-String $p.faultCode
-        StatusTooltipMessage   = Safe-String $p.statusTooltipMessage
-        ExtractDate            = $ExtractDate
-    }
-})
-Write-Log "SCA Policies: $($ScaPolicies.Count)" SUCCESS
-$RecordCounts["SCA_Policies"] = $ScaPolicies.Count
-
-# ===============================================================================
-# MODULE 6 : CSV EXPORT
-# Writes CSVs (PAM + SCA) to Blob Storage -- "Latest/<name>.csv" (overwritten
-# each run, the Power BI data source) AND "Archive/<RunTimestamp>/<name>.csv"
-# (historical snapshot), same as the on-prem Latest\/Archive\ folders.
-# ===============================================================================
-Write-Log "=== 6: Exporting CSV Files to Blob Storage ===" SECTION
-
-$CsvExports = @(
-    @{ Name="DIM_Region";            Data=$DimRegion;
-       Cols=@("RegionKey","RegionName","Prefixes") },
-    @{ Name="DIM_Safe";              Data=$DimSafe;
-       Cols=@("SafeName","SafeUrlId","SafeNumber","Description","Location","Creator","ManagingCPM","NumberOfAccounts","OLACEnabled","AutoPurge","RetentionVersions","RetentionDays","CreatedDate","CreatedDateTime","LastModifiedDateTime","IsDefault","SafeType","Region","Tier","Environment","NamingTechnology","AccessType","Team","TeamName","SafePurpose","HasCPM","IsEmpty","RecentlyCreated","NamingCompliant","ExtractDate") },
-    @{ Name="FACT_Accounts";         Data=$FactAccounts;
-       Cols=@("AccountID","Name","UserName","Address","SafeName","PlatformID","SecretType","IsDefaultSafe","SafeType","Region","Tier","Environment","NamingTechnology","AccessType","Team","TeamName","SafePurpose","OSCategory","AutoManaged","MgmtTechnique","ManualReason","ComplianceStatus","SecretStatus","LastChangeDate","LastChangeDateTime","DaysSinceChange","ExpectedRotationDays","RotationOverdue","LastVerifyDate","DaysSinceVerify","VerifyStatus","LastReconciledDate","IsStale","CreatedDate","CreatedMonth","AccountAgeDays","RecentlyOnboarded","NameCompliant","AddressCompliant","HasAddress","ExtractDate") },
-    @{ Name="FACT_Users";            Data=$FactUsers;
-       Cols=@("UserName","UserID","Source","UserType","ComponentUser","IsComponent","Enabled","Suspended","Location","FirstName","LastName","Email","VaultAuth","PasswordNeverExpires","LastLoginDate","LastLoginDateTime","DaysSinceLogin","LoginStatus","ExtractDate") },
-    @{ Name="FACT_VaultConnectivity";Data=$VaultRows;
-       Cols=@("ComponentType","InstanceIP","VaultUserName","ComponentVersion","IsLoggedOn","LastLogonDate","ExtractDate") },
-    @{ Name="FACT_OnboardingTrend";  Data=$TrendRows;
-       Cols=@("Month","Year","MonthNumber","MonthName","AccountsOnboarded","SafesCreated","ExtractDate") },
-    @{ Name="SCA_Policies";          Data=$ScaPolicies;
-       Cols=@("PolicyId","Name","Description","Status","StatusLabel","PrimaryStatus","CloudProvider","CloudProviderLabel","CreationDate","LastChanged","StartDate","ExpirationDate","MaxSessionDurationHours","UserEntityCount","RoleEntityCount","FaultCode","StatusTooltipMessage","ExtractDate") }
-)
-
-foreach ($export in $CsvExports) {
-    try {
-        if ($export.Data.Count -gt 0) {
-            $csvText = ($export.Data | Select-Object -Property $export.Cols | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
-        } else {
-            $csvText = ($export.Cols | ForEach-Object { '"' + $_ + '"' }) -join ','
+                $licenseFilePath = "$ExportDir\LicenseExpirationDate.txt"
+                "License Expiration Date: $licenseExpirationDateLocal" | Out-File $licenseFilePath -Force
+                Write-Host "License exported to $licenseFilePath" -ForegroundColor Cyan
+            }
         }
-        Send-BlobText -Container $LatestContainer  -BlobPath "$($export.Name).csv"                         -Content $csvText
-        Send-BlobText -Container $ArchiveContainer -BlobPath "$ArchivePathPrefix/$($export.Name).csv"      -Content $csvText
-        Write-Log "  [OK] $($export.Name) ($($export.Data.Count) rows)" SUCCESS
-    } catch {
-        Write-Log "  [FAIL] $($export.Name): $($_.Exception.Message)" ERROR
-        $RunErrors.Add("CSV Export ($($export.Name)): $($_.Exception.Message)")
+        else {
+            $csvFilePath = "$ExportDir\LicenseCapacityReport.csv"
+            $usersInfo | Select-Object Name, "UserType Description", "Licensed Users", "Existing Users", "Currently Logged On Users" | Export-Csv -Path $csvFilePath -NoTypeInformation -Force
+            Write-Host "Results exported to $csvFilePath" -ForegroundColor Cyan
+
+            $licenseFilePath = "$ExportDir\LicenseExpirationDate.txt"
+            "License Expiration Date: $licenseExpirationDateLocal" | Out-File $licenseFilePath -Force
+            Write-Host "License exported to $licenseFilePath" -ForegroundColor Cyan
+        }
+
+        Write-Host "To get more detailed report rerun the script with '-ReportType DetailedReport' flag." -ForegroundColor Magenta
     }
 }
 
-# =============================================================================
-#  MODULE 7 : RUN SUMMARY
-#  Writes run metadata to Blob Storage, prints console/App Insights report.
-# =============================================================================
+function Get-UserReportObject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$UserResponse,
 
-$ScriptEndTime   = Get-Date
-$DurationSeconds = [math]::Round(($ScriptEndTime - $ScriptStartTime).TotalSeconds, 1)
-$RunInfo = [ordered]@{
-    RunTimestamp      = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssK")
-    DurationSeconds   = $DurationSeconds
-    Status            = if ($RunErrors.Count -eq 0) { "Success" } else { "CompletedWithErrors" }
-    ExtractDate       = $ExtractDate
-    PowerShellVersion = "$($PSVersionTable.PSVersion)"
-    RecordCounts      = $RecordCounts
-    Errors            = $RunErrors
-}
-$runInfoJson = ($RunInfo | ConvertTo-Json -Depth 4)
-try {
-    Send-BlobText -Container $LatestContainer  -BlobPath "_RunMetadata.json"                         -Content $runInfoJson -ContentType "application/json"
-    Send-BlobText -Container $ArchiveContainer -BlobPath "$ArchivePathPrefix/_RunMetadata.json"      -Content $runInfoJson -ContentType "application/json"
-    Write-Log "Run metadata written to Blob Storage." SUCCESS
-} catch {
-    Write-Log "Failed to write run metadata: $($_.Exception.Message)" ERROR
-    $RunErrors.Add("RunMetadata: $($_.Exception.Message)")
-}
+        [Parameter(Mandatory = $true)]
+        [string]$ReportedUserType,
 
-# ── Console summary (Application Insights / Functions log stream) ───────────
-$Divider = "=" * 75; $SubDivider = "-" * 75
-Write-Host ""
-Write-Host $Divider
-Write-Host "  CYBERARK DASHBOARD (PAM + SCA) — AZURE FUNCTION"
-Write-Host "  Generated : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Host "  Duration  : $DurationSeconds seconds"
-Write-Host $Divider
+        [Parameter(Mandatory = $true)]
+        [int]$InactiveDays
+    )
 
-Write-Host ""
-Write-Host "  PAM INVENTORY"
-Write-Host $SubDivider
-Write-Host ("  Safes               : {0} total | {1} business | {2} default" -f $DimSafe.Count, $bizSafes.Count, ($DimSafe.Count - $bizSafes.Count))
-Write-Host ("  Accounts            : {0} total | {1} business" -f $AcctRaw.Count, $biz.Count)
-Write-Host ("  Users               : {0} total | {1} real | {2} active" -f $UsersRaw.Count, $realUsers.Count, @($realUsers | Where-Object { $_.LoginStatus -like 'Active*' }).Count)
+    $lastLoginDateString = "Never"
+    $inactive = $true
 
-Write-Host ""
-Write-Host "  PAM COMPLIANCE"
-Write-Host $SubDivider
-$compliant = @($biz | Where-Object { $_.ComplianceStatus -eq "Compliant" }).Count
-$compRate  = if ($biz.Count -gt 0) { [math]::Round(($compliant / $biz.Count) * 100, 1) } else { 0 }
-Write-Host ("  Compliance Rate     : {0}%" -f $compRate)
-Write-Host ("  Rotation Overdue    : {0}" -f @($biz | Where-Object { $_.RotationOverdue }).Count)
-Write-Host ("  Empty Safes         : {0}" -f @($bizSafes | Where-Object { $_.IsEmpty }).Count)
+    if ($UserResponse.PSObject.Properties.Name -contains 'lastSuccessfulLoginDate' -and
+        $null -ne $UserResponse.lastSuccessfulLoginDate -and
+        [string]$UserResponse.lastSuccessfulLoginDate -match '^\d+$' -and
+        [int64]$UserResponse.lastSuccessfulLoginDate -gt 0) {
 
-Write-Host ""
-Write-Host "  PAM VAULT CONNECTIVITY"
-Write-Host $SubDivider
-foreach ($compType in $VaultComponentIDs) {
-    $typeRows = @($VaultRows | Where-Object { $_.ComponentType -eq $compType })
-    $loggedOn = @($typeRows | Where-Object { $_.IsLoggedOn -eq "TRUE" }).Count
-    if ($typeRows.Count -gt 0) {
-        Write-Host ("  {0,-20} : {1} total | {2} connected" -f $compType, $typeRows.Count, $loggedOn)
+        $lastLoginDate = [DateTimeOffset]::FromUnixTimeSeconds([int64]$UserResponse.lastSuccessfulLoginDate).ToLocalTime()
+        $lastLoginDateString = $lastLoginDate.ToString()
+        $daysSinceLastLogin = (Get-Date) - $lastLoginDate.DateTime
+        $inactive = $daysSinceLastLogin.TotalDays -gt $InactiveDays
+    }
+
+    return [PSCustomObject]@{
+        UserName                           = $UserResponse.Username
+        UserType                           = $ReportedUserType
+        LastLoginDate                      = $lastLoginDateString
+        "Inactive for $($InactiveDays) Days" = $inactive
     }
 }
 
-Write-Host ""
-Write-Host "  SCA ACCESS POLICIES"
-Write-Host $SubDivider
-Write-Host ("  Total Policies      : {0}" -f $ScaPolicies.Count)
-Write-Host ("  Active Policies     : {0}" -f @($ScaPolicies | Where-Object StatusLabel -eq "Active").Count)
-Write-Host ("  Error Policies      : {0}" -f @($ScaPolicies | Where-Object StatusLabel -eq "Error").Count)
+function Get-MissingUserTypeReportObject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$UserResponse,
 
-Write-Host ""
-Write-Host "  OUTPUT"
-Write-Host $SubDivider
-Write-Host ("  CSV Files           : {0}" -f $CsvExports.Count)
-Write-Host ("  Latest (Power BI)   : {0}" -f $LatestContainer)
-Write-Host ("  Archive (This Run)  : {0}/{1}" -f $ArchiveContainer, $ArchivePathPrefix)
-Write-Host ("  Log (This Run)      : {0}/{1}.log" -f $LogsContainer, $RunTimestamp)
-Write-Host ("  Duration            : {0}s" -f $DurationSeconds)
-Write-Host ("  Errors              : {0}" -f $RunErrors.Count)
-if ($RunErrors.Count -gt 0) {
-    Write-Host ""
-    Write-Host "  Error Details:"
-    foreach ($err in $RunErrors) { Write-Host "    * $err" }
+        [Parameter(Mandatory = $true)]
+        [psobject]$ListUserObject,
+
+        [Parameter(Mandatory = $true)]
+        [int]$InactiveDays
+    )
+
+    $lastLoginDateString = "Never"
+    $inactive = $true
+
+    if ($UserResponse.PSObject.Properties.Name -contains 'lastSuccessfulLoginDate' -and
+        $null -ne $UserResponse.lastSuccessfulLoginDate -and
+        [string]$UserResponse.lastSuccessfulLoginDate -match '^\d+$' -and
+        [int64]$UserResponse.lastSuccessfulLoginDate -gt 0) {
+
+        $lastLoginDate = [DateTimeOffset]::FromUnixTimeSeconds([int64]$UserResponse.lastSuccessfulLoginDate).ToLocalTime()
+        $lastLoginDateString = $lastLoginDate.ToString()
+        $daysSinceLastLogin = (Get-Date) - $lastLoginDate.DateTime
+        $inactive = $daysSinceLastLogin.TotalDays -gt $InactiveDays
+    }
+
+    return [PSCustomObject]@{
+        ID                                 = $UserResponse.id
+        UserName                           = $UserResponse.Username
+        Source                             = $UserResponse.source
+        UserType                           = $ListUserObject.userType
+        ComponentUser                      = $ListUserObject.componentUser
+        LastLoginDate                      = $lastLoginDateString
+        "Inactive for $($InactiveDays) Days" = $inactive
+        Finding                            = "Missing UserType (license may no longer support previous type)"
+    }
 }
-Write-Host ""
-Write-Host $Divider
-Write-Log "=== CyberArk Dashboard Complete ===" SECTION
 
-} catch {
-    Write-Log "FATAL: $($_.Exception.Message)" ERROR
-    $FatalError = $_
-} finally {
-    # Upload the accumulated log as one blob, named by run timestamp, regardless
-    # of whether the run above succeeded or threw -- a failed run's log is the
-    # one you most need to see.
-    try {
-        $logText = ($LogLines -join "`r`n")
-        Send-BlobText -Container $LogsContainer -BlobPath "$RunTimestamp.log" -Content $logText -ContentType "text/plain; charset=utf-8"
-    } catch {
-        $uploadErrMsg = "Failed to upload log blob to '$LogsContainer/$RunTimestamp.log': $($_.Exception.Message)"
-        Write-Host $uploadErrMsg
-        # Fallback so this is visible WITHOUT Application Insights access: write
-        # the caught error itself into the Latest container, which by this point
-        # in the run has already proven to accept writes successfully.
+function Get-UserType {
+    param (
+        [string]$UserType,
+        [string]$URLAPI
+    )
+
+    $uri = "$URLAPI/Users?UserType=$UserType"
+    $retryCount = 0
+    $success = $false
+
+    while (-not $success -and $retryCount -lt 3) {
         try {
-            Send-BlobText -Container $LatestContainer -BlobPath "_LastLogUploadError.txt" -Content $uploadErrMsg -ContentType "text/plain; charset=utf-8"
-        } catch {
-            # Nothing more we can do to surface this -- both the intended log
-            # write and this fallback failed. Falls through to Write-Host only.
+            Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+
+            $response = Invoke-RestMethod -Uri $uri -Headers $logonheader -Method GET -UseBasicParsing
+            $success = $true
+
+            $responseUsers = @($response.Users)
+
+            # Keep only users whose actual returned userType matches the requested type
+            $responseFiltered = @(
+                $responseUsers | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_.userType) -and $_.userType -eq $UserType
+                }
+            )
+
+            # Capture users returned by the API without a userType
+            $missingUserTypeUsers = @(
+                $responseUsers | Where-Object {
+                    [string]::IsNullOrWhiteSpace($_.userType)
+                }
+            )
+
+            Write-Host ""
+            Write-Host "$UserType = $($responseFiltered.Count)" -ForegroundColor Green
+
+            if ($responseFiltered.Count -ge 1) {
+                Write-Host "----------Start $UserType-----------------"
+
+                $userInformation = @()
+
+                foreach ($user in $responseFiltered.id) {
+                    $userSuccess = $false
+                    $userRetryCount = 0
+
+                    while (-not $userSuccess -and $userRetryCount -lt 3) {
+                        try {
+                            Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+                            Start-Sleep -Milliseconds 70
+
+                            $UserResponse = Invoke-RestMethod -Uri "$URLAPI/Users/$user" -Headers $logonheader
+
+                            $userObject = Get-UserReportObject -UserResponse $UserResponse -ReportedUserType ([string]$UserType) -InactiveDays $InactiveDays
+                            $userInformation += $userObject
+
+                            if ($userObject."Inactive for $($InactiveDays) Days") {
+                                Write-Host "UserName: $($UserResponse.Username) LastLoginDate: $($userObject.LastLoginDate)" -ForegroundColor Yellow
+                            }
+                            else {
+                                Write-Host "UserName: $($UserResponse.Username) LastLoginDate: $($userObject.LastLoginDate)" -ForegroundColor Gray
+                            }
+
+                            $userSuccess = $true
+                        }
+                        catch {
+                            if ($_.Exception.Response.StatusCode -eq 401) {
+                                Write-Host "401 Unauthorized error encountered for userID $($user). Refreshing token and retrying..." -ForegroundColor Yellow
+                                Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+                                $userRetryCount++
+                            }
+                            else {
+                                Write-Host "Error fetching details for userID $($user) $($_.Exception.Message) $($_.ErrorDetails.Message) $($_.Exception.Status)" -ForegroundColor Red
+                                $userSuccess = $true
+                            }
+                        }
+                    }
+
+                    if (-not $userSuccess) {
+                        Write-Host "Max retries reached for user $user. Moving to the next user..." -ForegroundColor Red
+                    }
+                }
+
+                Write-Host "----------End $UserType-----------------"
+
+                if ($ExportToCSV.IsPresent) {
+                    $csvFilePath = "$ExportDir\$UserType-UsersReport.csv"
+                    $userInformation | Export-Csv -Path $csvFilePath -NoTypeInformation -Force
+                    Write-Host "Results exported to $csvFilePath" -ForegroundColor Cyan
+                }
+            }
+
+            # Report users with missing UserType only once, preferably during EPVUser processing
+            if ($UserType -eq "EPVUser" -and -not $script:MissingUserTypeHandled -and $missingUserTypeUsers.Count -gt 0) {
+                Write-Host ""
+                Write-Host "----------Users with Missing UserType-----------------" -ForegroundColor Yellow
+                Write-Host "Note: These users may have been created under a previous license that supported additional user types." -ForegroundColor DarkYellow
+
+                $missingUserTypeInformation = @()
+
+                foreach ($missingUser in $missingUserTypeUsers) {
+                    $missingUserSuccess = $false
+                    $missingRetryCount = 0
+
+                    while (-not $missingUserSuccess -and $missingRetryCount -lt 3) {
+                        try {
+                            Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+                            Start-Sleep -Milliseconds 70
+
+                            $MissingUserResponse = Invoke-RestMethod -Uri "$URLAPI/Users/$($missingUser.id)" -Headers $logonheader
+
+                            $missingUserObject = Get-MissingUserTypeReportObject -UserResponse $MissingUserResponse -ListUserObject $missingUser -InactiveDays $InactiveDays
+                            $missingUserTypeInformation += $missingUserObject
+
+                            Write-Host "UserName: $($missingUserObject.UserName) | ComponentUser: $($missingUserObject.ComponentUser) | LastLoginDate: $($missingUserObject.LastLoginDate)" -ForegroundColor Yellow
+
+                            $missingUserSuccess = $true
+                        }
+                        catch {
+                            if ($_.Exception.Response.StatusCode -eq 401) {
+                                Write-Host "401 Unauthorized error encountered for missing-userType userID $($missingUser.id). Refreshing token and retrying..." -ForegroundColor Yellow
+                                Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+                                $missingRetryCount++
+                            }
+                            else {
+                                Write-Host "Error fetching details for missing-userType userID $($missingUser.id) $($_.Exception.Message) $($_.ErrorDetails.Message) $($_.Exception.Status)" -ForegroundColor Red
+                                $missingUserSuccess = $true
+                            }
+                        }
+                    }
+
+                    if (-not $missingUserSuccess) {
+                        Write-Host "Max retries reached for missing-userType user $($missingUser.id). Moving to the next user..." -ForegroundColor Red
+                    }
+                }
+
+                Write-Host "Users with Missing UserType: $($missingUserTypeInformation.Count)" -ForegroundColor Yellow
+                Write-Host "------------------------------------------------------" -ForegroundColor Yellow
+
+                if ($ExportToCSV.IsPresent) {
+                    $missingUserTypeCsvFilePath = "$ExportDir\MissingUserType-Users.csv"
+                    $missingUserTypeInformation | Export-Csv -Path $missingUserTypeCsvFilePath -NoTypeInformation -Force
+                    Write-Host "Users with Missing UserType exported to $missingUserTypeCsvFilePath" -ForegroundColor Cyan
+                }
+
+                $script:MissingUserTypeHandled = $true
+            }
         }
+        catch {
+            if ($_.Exception.Message -like "*(400) Bad Request*") {
+                $response = [PSCustomObject]@{ Total = 0 }
+                $success = $true
+            }
+            elseif ($_.Exception.Response.StatusCode -eq 401) {
+                Write-Host "401 Unauthorized error encountered. Refreshing token and retrying..." -ForegroundColor Yellow
+                Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+                $retryCount++
+            }
+            else {
+                Write-Host "Error fetching user type details: $($_.Exception.Message) $($_.ErrorDetails.Message) $($_.Exception.Status)" -ForegroundColor Red
+                $success = $true
+            }
+        }
+    }
+
+    if (-not $success) {
+        Write-Host "Max retries reached for $UserType. Moving to the next user type..." -ForegroundColor Red
     }
 }
 
-if ($FatalError) {
-    # Re-throw after the log is safely uploaded, so Azure Functions still marks
-    # this invocation as Failed (for retry policy / monitoring) rather than
-    # silently swallowing the error.
-    throw $FatalError
+# Main
+try {
+    Write-Host "Script Version: $scriptVersion" -ForegroundColor Gray
+
+    # Build PVWA URLs
+    $platformURLs = DetermineTenantTypeURLs -PortalURL $PortalURL
+    $IdentityAPIURL = $platformURLs.IdentityURL
+    $pvwaAPI = $platformURLs.PVWA_API_URLs.PVWAAPI
+    $VaultURL = $platformURLs.vaultURL
+    $global:AlreadyAnswered = $false
+
+    if ([string]::IsNullOrEmpty($ReportType)) {
+        $SelectOption = Get-Choice -Title "Choose Report Type" -Options "License Capacity Report","Detailed User Report" -DefaultChoice 1
+        if ($SelectOption -like "*Detailed*") {
+            $script:ReportType = "DetailedReport"
+        }
+        else {
+            $script:ReportType = "CapacityReport"
+        }
+    }
+
+    if ($ReportType -eq "DetailedReport") {
+        Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+
+        Write-Host ""
+        Write-Host "Privilege Cloud consumed users report for tenant $PortalURL"
+        Write-Host "-----------------------------------------------------------------------"
+        Write-Host "Yellow Users = Inactive for more than $($InactiveDays) days" -ForegroundColor Black -BackgroundColor Yellow
+
+        foreach ($userType in $GetSpecificuserTypes) {
+            Get-UserType -UserType $userType -URLAPI $pvwaAPI
+        }
+    }
+    else {
+        $ForceAuthType = "cyberark"
+        Refresh-Token -PlatformURLs $platformURLs -creds $Credentials -ForceAuthType $ForceAuthType
+
+        Write-Host "Privilege Cloud Capacity report for tenant $PortalURL"
+        Write-Host "-----------------------------------------------------------------------"
+
+        Get-LicenseCapacityReport -vaultIp $VaultURL -GetSpecificuserTypes $GetSpecificuserTypes
+    }
 }
+catch {
+    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Error Details: $($_.ErrorDetails.Message)" -ForegroundColor Red
+    Write-Host "Exiting..."
+}
+finally {
+    $Credentials = $null
+    try {
+        Invoke-RestMethod -Uri $($platformURLs.PVWA_API_URLs.Logoff) -Method Post -Headers $logonHeader | Out-Null
+    }
+    catch {}
+}
+# SIG # Begin signature block
+# MIIpLQYJKoZIhvcNAQcCoIIpHjCCKRoCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDpVci6IurbieNe
+# PXszb9SIXkOUf25Pobmv8YobBj/hQKCCDq8wggboMIIE0KADAgECAhB3vQ4Ft1kL
+# th1HYVMeP3XtMA0GCSqGSIb3DQEBCwUAMFMxCzAJBgNVBAYTAkJFMRkwFwYDVQQK
+# ExBHbG9iYWxTaWduIG52LXNhMSkwJwYDVQQDEyBHbG9iYWxTaWduIENvZGUgU2ln
+# bmluZyBSb290IFI0NTAeFw0yMDA3MjgwMDAwMDBaFw0zMDA3MjgwMDAwMDBaMFwx
+# CzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9iYWxTaWduIG52LXNhMTIwMAYDVQQD
+# EylHbG9iYWxTaWduIEdDQyBSNDUgRVYgQ29kZVNpZ25pbmcgQ0EgMjAyMDCCAiIw
+# DQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAMsg75ceuQEyQ6BbqYoj/SBerjgS
+# i8os1P9B2BpV1BlTt/2jF+d6OVzA984Ro/ml7QH6tbqT76+T3PjisxlMg7BKRFAE
+# eIQQaqTWlpCOgfh8qy+1o1cz0lh7lA5tD6WRJiqzg09ysYp7ZJLQ8LRVX5YLEeWa
+# tSyyEc8lG31RK5gfSaNf+BOeNbgDAtqkEy+FSu/EL3AOwdTMMxLsvUCV0xHK5s2z
+# BZzIU+tS13hMUQGSgt4T8weOdLqEgJ/SpBUO6K/r94n233Hw0b6nskEzIHXMsdXt
+# HQcZxOsmd/KrbReTSam35sOQnMa47MzJe5pexcUkk2NvfhCLYc+YVaMkoog28vmf
+# vpMusgafJsAMAVYS4bKKnw4e3JiLLs/a4ok0ph8moKiueG3soYgVPMLq7rfYrWGl
+# r3A2onmO3A1zwPHkLKuU7FgGOTZI1jta6CLOdA6vLPEV2tG0leis1Ult5a/dm2tj
+# IF2OfjuyQ9hiOpTlzbSYszcZJBJyc6sEsAnchebUIgTvQCodLm3HadNutwFsDeCX
+# pxbmJouI9wNEhl9iZ0y1pzeoVdwDNoxuz202JvEOj7A9ccDhMqeC5LYyAjIwfLWT
+# yCH9PIjmaWP47nXJi8Kr77o6/elev7YR8b7wPcoyPm593g9+m5XEEofnGrhO7izB
+# 36Fl6CSDySrC/blTAgMBAAGjggGtMIIBqTAOBgNVHQ8BAf8EBAMCAYYwEwYDVR0l
+# BAwwCgYIKwYBBQUHAwMwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQUJZ3Q
+# /FkJhmPF7POxEztXHAOSNhEwHwYDVR0jBBgwFoAUHwC/RoAK/Hg5t6W0Q9lWULvO
+# ljswgZMGCCsGAQUFBwEBBIGGMIGDMDkGCCsGAQUFBzABhi1odHRwOi8vb2NzcC5n
+# bG9iYWxzaWduLmNvbS9jb2Rlc2lnbmluZ3Jvb3RyNDUwRgYIKwYBBQUHMAKGOmh0
+# dHA6Ly9zZWN1cmUuZ2xvYmFsc2lnbi5jb20vY2FjZXJ0L2NvZGVzaWduaW5ncm9v
+# dHI0NS5jcnQwQQYDVR0fBDowODA2oDSgMoYwaHR0cDovL2NybC5nbG9iYWxzaWdu
+# LmNvbS9jb2Rlc2lnbmluZ3Jvb3RyNDUuY3JsMFUGA1UdIAROMEwwQQYJKwYBBAGg
+# MgECMDQwMgYIKwYBBQUHAgEWJmh0dHBzOi8vd3d3Lmdsb2JhbHNpZ24uY29tL3Jl
+# cG9zaXRvcnkvMAcGBWeBDAEDMA0GCSqGSIb3DQEBCwUAA4ICAQAldaAJyTm6t6E5
+# iS8Yn6vW6x1L6JR8DQdomxyd73G2F2prAk+zP4ZFh8xlm0zjWAYCImbVYQLFY4/U
+# ovG2XiULd5bpzXFAM4gp7O7zom28TbU+BkvJczPKCBQtPUzosLp1pnQtpFg6bBNJ
+# +KUVChSWhbFqaDQlQq+WVvQQ+iR98StywRbha+vmqZjHPlr00Bid/XSXhndGKj0j
+# fShziq7vKxuav2xTpxSePIdxwF6OyPvTKpIz6ldNXgdeysEYrIEtGiH6bs+XYXvf
+# cXo6ymP31TBENzL+u0OF3Lr8psozGSt3bdvLBfB+X3Uuora/Nao2Y8nOZNm9/Lws
+# 80lWAMgSK8YnuzevV+/Ezx4pxPTiLc4qYc9X7fUKQOL1GNYe6ZAvytOHX5OKSBoR
+# HeU3hZ8uZmKaXoFOlaxVV0PcU4slfjxhD4oLuvU/pteO9wRWXiG7n9dqcYC/lt5y
+# A9jYIivzJxZPOOhRQAyuku++PX33gMZMNleElaeEFUgwDlInCI2Oor0ixxnJpsoO
+# qHo222q6YV8RJJWk4o5o7hmpSZle0LQ0vdb5QMcQlzFSOTUpEYck08T7qWPLd0jV
+# +mL8JOAEek7Q5G7ezp44UCb0IXFl1wkl1MkHAHq4x/N36MXU4lXQ0x72f1LiSY25
+# EXIMiEQmM2YBRN/kMw4h3mKJSAfa9TCCB78wggWnoAMCAQICDFvWkQMw/ZfAZpUM
+# wDANBgkqhkiG9w0BAQsFADBcMQswCQYDVQQGEwJCRTEZMBcGA1UEChMQR2xvYmFs
+# U2lnbiBudi1zYTEyMDAGA1UEAxMpR2xvYmFsU2lnbiBHQ0MgUjQ1IEVWIENvZGVT
+# aWduaW5nIENBIDIwMjAwHhcNMjYwMzAyMjE1MjMzWhcNMjcwMjI3MTM0MDU2WjCC
+# AQQxHTAbBgNVBA8MFFByaXZhdGUgT3JnYW5pemF0aW9uMRIwEAYDVQQFEwk1MTIy
+# OTE2NDIxEzARBgsrBgEEAYI3PAIBAxMCSUwxCzAJBgNVBAYTAklMMRkwFwYDVQQI
+# ExBDZW50cmFsIERpc3RyaWN0MRQwEgYDVQQHEwtQZXRhaCBUaWt2YTEXMBUGA1UE
+# CRMOOSBIYXBzYWdvdCBTdC4xHzAdBgNVBAoTFkN5YmVyQXJrIFNvZnR3YXJlIEx0
+# ZC4xHzAdBgNVBAMTFkN5YmVyQXJrIFNvZnR3YXJlIEx0ZC4xITAfBgkqhkiG9w0B
+# CQEWEmFkbWluQGN5YmVyYXJrLmNvbTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBAKtAr5PeV7TdJZDWUNp8j60tepBmgC2+9Dw8tUh+RsLhqaSNi0dUc7i9
+# yznveSdnfE4l2U8ZXyEILjQsSJw3SaPaXMSOzR4wVnuTc1nTzKBOS3oa6Yil7rlu
+# gNXVj8dmEEehcPuAkF4ciqt6YChi5a6DD/r8GYuHv+/75XDZCD1nTPesDLIN+RAU
+# aqHWLF0XRDXwF/JgB6W+lzIuYeiXdM/jPxZqvg1d7WKZQCy0maucWE/n4N4/8nPT
+# qLm3y8jhUdP6YGUlyJLbC4fxbVW1KrhDMY1DOOtItuBiOeBVAvVctbw/kAvEc32Y
+# Iz3qIWTmcR0VzVVV6IlNWOrMqJZEvtHlqRVkekLJXB5pVw6b3PuelU92cb+VtUnB
+# hewMxSkPj8094wN7urFk7wXxVtNVTYtkmT5ThcphO5Sha1bCfTgymePAfUJW2p2o
+# FdNBDeMoSmVlTDDlffRpyMzFZpHpc6v0HzeLmkEcZk+HRf5dgeRMQZWt/Mgsizwe
+# w0RuaCeQlphX7RgBRkC9rT57RCcBMtW3blk4Vz6qncCKCLBCJK1CIrC2frGX7vqt
+# In+0zR1K0ec8tTH5im5QEE72MuMV+/4KbP+ISojaQ8JFZvqESxyAUbjpQcE2pfzv
+# fwKiSXTyOCv9buuHDViUhoSc9oEKA3iuhc8Yz21F4CO0MTj014+FAgMBAAGjggHV
+# MIIB0TAOBgNVHQ8BAf8EBAMCB4AwgZ8GCCsGAQUFBwEBBIGSMIGPMEwGCCsGAQUF
+# BzAChkBodHRwOi8vc2VjdXJlLmdsb2JhbHNpZ24uY29tL2NhY2VydC9nc2djY3I0
+# NWV2Y29kZXNpZ25jYTIwMjAuY3J0MD8GCCsGAQUFBzABhjNodHRwOi8vb2NzcC5n
+# bG9iYWxzaWduLmNvbS9nc2djY3I0NWV2Y29kZXNpZ25jYTIwMjAwVQYDVR0gBE4w
+# TDBBBgkrBgEEAaAyAQIwNDAyBggrBgEFBQcCARYmaHR0cHM6Ly93d3cuZ2xvYmFs
+# c2lnbi5jb20vcmVwb3NpdG9yeS8wBwYFZ4EMAQMwCQYDVR0TBAIwADBHBgNVHR8E
+# QDA+MDygOqA4hjZodHRwOi8vY3JsLmdsb2JhbHNpZ24uY29tL2dzZ2NjcjQ1ZXZj
+# b2Rlc2lnbmNhMjAyMC5jcmwwHQYDVR0RBBYwFIESYWRtaW5AY3liZXJhcmsuY29t
+# MBMGA1UdJQQMMAoGCCsGAQUFBwMDMB8GA1UdIwQYMBaAFCWd0PxZCYZjxezzsRM7
+# VxwDkjYRMB0GA1UdDgQWBBR/nObXnnoINvefWdWmW4iZSqmPAjANBgkqhkiG9w0B
+# AQsFAAOCAgEAvpUZ9sMYv3kb7+v5CzJoUgOAtOF21kKgzqrgRmwH/xyuXkhs+tY9
+# LCE3ldhZmAJIfgBKZuKUQL5eFmLHltBevBKfgmfaT6uoG0sJ3QyNu46m2hMr/gvm
+# Kms2zfFGOZxG8wHeZUQ1v8imN80Frvvy1DIdA1QOW4hIJvt1GbCaS6TTC3eO9/fO
+# r22hHk0IBt+LtmSeA/rdFsnwT4Y4SY4mebZZePHH9c+KreM64DAP61rLodKQCw14
+# jbPTlQRSelbJpb+Vmo7q1sieuCY5US2KsXG/4P/ENEJFnwH+ib671IjN7L4AISzt
+# BoKY81CNMBSziqMpdCwrAiXBQhBHdKUG28MhrxS1gB564h+fo9tMrV5pe6Jp60Sa
+# Wn5aQzu/nWR6z+gUR9mk5SdjBow+Liykxd/2o5wT8AmJ6XE/vGd7lK8MnuoTeJ65
+# WQOsMd7MyB4tP3CV9/r+JESfPExxK3ybfWp1cAigtzpGII2fUM0sx43Wd7w0Ugfp
+# OjmGOUKpshp6zJAqG+NNbupqk5vHAiddvHHRrZGLF7qbc0jcdQyxygyxQLe5Quu3
+# M/bZ5+b4T+4xT/b0hmU4WmiHV8h3OF6U6OvIU2+gJ8NtRSkl+Jz/nhhU5hhNh2Ad
+# TB108wYNMYET2xxoxtEPL5Sb0rX07I4lEGPpbwAcP1jds2+pgeB1pYcxghnUMIIZ
+# 0AIBATBsMFwxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9iYWxTaWduIG52LXNh
+# MTIwMAYDVQQDEylHbG9iYWxTaWduIEdDQyBSNDUgRVYgQ29kZVNpZ25pbmcgQ0Eg
+# MjAyMAIMW9aRAzD9l8BmlQzAMA0GCWCGSAFlAwQCAQUAoHwwEAYKKwYBBAGCNwIB
+# DDECMAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIOCC1Ng/+1KXcFFDd3aLoI89
+# KnbJr97009Nk7x/IzuJwMA0GCSqGSIb3DQEBAQUABIICAHm24f9tLMlRh4HYFgKz
+# 9j99Ab2PSx/3yQULrox5C3Ok+nkoDoxYwiIOD5pY1PotHX59so/1F6yDcNx5G3HU
+# yIY4Z7T1WzZBBDT9TA914n+P0zZk+GzByovwo/29r28zhcUUSpJkuHufmA1UbHmS
+# gwd9LF/yBbzw72fyi6sZtC0HKu3oz7BEBq6bff63gQtUQR9JgDEpV6taGGrookVn
+# IY5qYeYUWu/UKfuVxDC1FpPklFFCaVFXIwehS+DkharJYJuQcC9k890KSVxWD6dh
+# TRTUNTL9af/k+7IDYYFedG6y0NKUbZn+ooUhVX1omEJ42h2WAIukQVuljqvDb8pL
+# SMNFOl3+Bi9U6vK07rkQXbVlozwZroopMZtxGGr7CW9VwpOgCf+E4lbZQWJkh7Lt
+# Ip0Qj+Dlp/ub9gXeNWwUepx/zrFx7gnP1tfdk2niexRg3IHS0GuOJOv9ZMVwurQr
+# imzLXpWT5F/RbeQbJQkJkgcMzlr3P3z2AyPF7co01K9rvTXMGNdq5JIdMIjZ4BTS
+# 82S0TXAAaBBqDFhyf7uyXlcMb0OMTr8EbQwTMBIDzv99kmnq8oM18ajaRH/DjFmL
+# zw4ZGsMf3g8EuNK6r/wIMXirOpjy7fupGCUMRwEpTCFbjqKc+XUUKli3V/yBbatb
+# HWAzdQUk04Tqc6OzEOczVJDQoYIWuzCCFrcGCisGAQQBgjcDAwExghanMIIWowYJ
+# KoZIhvcNAQcCoIIWlDCCFpACAQMxDTALBglghkgBZQMEAgEwgd8GCyqGSIb3DQEJ
+# EAEEoIHPBIHMMIHJAgEBBgsrBgEEAaAyAgMBAjAxMA0GCWCGSAFlAwQCAQUABCAN
+# mKAxiFkvF4wYq4EC0Z6qC3XFJwEW5ytTLq8t0IDjBQIUBGI0/pk5aEcNgyhXd16b
+# zS/umCMYDzIwMjYwMzI3MTIxNzE1WjADAgEBoFikVjBUMQswCQYDVQQGEwJCRTEZ
+# MBcGA1UECgwQR2xvYmFsU2lnbiBudi1zYTEqMCgGA1UEAwwhR2xvYmFsc2lnbiBU
+# U0EgZm9yIENvZGVTaWduMSAtIFI2oIISSzCCBmMwggRLoAMCAQICEAEACyAFs5QH
+# Yts+NnmUm6kwDQYJKoZIhvcNAQEMBQAwWzELMAkGA1UEBhMCQkUxGTAXBgNVBAoT
+# EEdsb2JhbFNpZ24gbnYtc2ExMTAvBgNVBAMTKEdsb2JhbFNpZ24gVGltZXN0YW1w
+# aW5nIENBIC0gU0hBMzg0IC0gRzQwHhcNMjUwNDExMTQ0NzM5WhcNMzQxMjEwMDAw
+# MDAwWjBUMQswCQYDVQQGEwJCRTEZMBcGA1UECgwQR2xvYmFsU2lnbiBudi1zYTEq
+# MCgGA1UEAwwhR2xvYmFsc2lnbiBUU0EgZm9yIENvZGVTaWduMSAtIFI2MIIBojAN
+# BgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAolvEqk1J5SN4PuCF6+aqCj7V8qyo
+# p0Rh94rLmY37Cn8er80SkfKzdJHJk3Tqa9QY4UwV6hedXfSb5gk0Xydy3MNEj1qE
+# +ZomPEcjC7uRtGdfB/PtnieWJzjtPVUlmEPrUMsoFU7woJScRV1W6/6efi2BySHX
+# shZ30V1EDZ2lKQ0DK3q3bI4sJE/5n/dQy8iL4hjTaS9v0YQy5RJY+o1NWhxP/HsN
+# um67Or4rFDsGIE85hg5r4g3CXFuiqWvlNmPbCBWgdxp/PCqY0Lie04DuKbDwRd6n
+# rm5AH5oIRJyFUjLvG4HO0L1UXYMuJ6J1JzO438RA0mJRvU2ZwbI6yiFHaS0x3SgF
+# akvhELLn4tmwngYPj+FDX3LaWHnni/MGJXRxnN0pQdYJqEYhKUlrMH9+2Klndcz/
+# 9yXYGEywTt88d3y+TUFvZlAA0BMOYMMrYFQEptlRg2DYrx5sWtX1qvCzk6sEBLRV
+# PEbE0i+J01ILlBzRpcJusZUQyGK2RVSOFfXPAgMBAAGjggGoMIIBpDAOBgNVHQ8B
+# Af8EBAMCB4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwHQYDVR0OBBYEFIBDTPy6
+# bR0T0nUSiAl3b9vGT5VUMFYGA1UdIARPME0wCAYGZ4EMAQQCMEEGCSsGAQQBoDIB
+# HjA0MDIGCCsGAQUFBwIBFiZodHRwczovL3d3dy5nbG9iYWxzaWduLmNvbS9yZXBv
+# c2l0b3J5LzAMBgNVHRMBAf8EAjAAMIGQBggrBgEFBQcBAQSBgzCBgDA5BggrBgEF
+# BQcwAYYtaHR0cDovL29jc3AuZ2xvYmFsc2lnbi5jb20vY2EvZ3N0c2FjYXNoYTM4
+# NGc0MEMGCCsGAQUFBzAChjdodHRwOi8vc2VjdXJlLmdsb2JhbHNpZ24uY29tL2Nh
+# Y2VydC9nc3RzYWNhc2hhMzg0ZzQuY3J0MB8GA1UdIwQYMBaAFOoWxmnn48tXRTkz
+# pPBAvtDDvWWWMEEGA1UdHwQ6MDgwNqA0oDKGMGh0dHA6Ly9jcmwuZ2xvYmFsc2ln
+# bi5jb20vY2EvZ3N0c2FjYXNoYTM4NGc0LmNybDANBgkqhkiG9w0BAQwFAAOCAgEA
+# t6bHSpl2dP0gYie9iXw3Bz5XzwsvmiYisEjboyRZin+jqH26IFq7fQMIrN5VdX8K
+# Gl5pEe21b8skPfUctiroo6QS5oWESl4kzZow2iJ/qJn76TkvL+v2f4mHolGLBwyD
+# m74fXr68W63xuiYSpnbf7NYPyBaHI7zJ/ErST4bA00TC+ftPttS+G/MhNUaKg34y
+# aJ8Z6AENnPdCB8VIrt/sqd6R1k89Ojx1jL36QBEPUr2dtIIlS3Ki74CU15YTvG+X
+# xt9cwE+0Gx/qRQv8YbF+UcsdgYU4jNRZB0kTV3Bsd3lyIWmt8DT4RQj9LQ1ILOpq
+# G/Czwd9q9GJL6jSJeSq1AC4ZocVMuqcYd/D9JpIML9BQ/wk5lgJkgXEc1gRgPsDs
+# U9zz36JymN1+Yhvx0Vr67jr0Qfqk3V0z6/xVmEAJKafTeIfD9hQchjiGkyw3EKNi
+# yHyM37rdK/BsTSx0rB3MHdqE9/dHQX5NUOQCWUvhkWy10u71yzGKWnbAWQ6NNuq9
+# ftcwYFTmcyo5YbFwzfkyS+Y78+O9utqgi6VoE2NzVJbucqGLZtJFJzGJD7xe/rqU
+# LwYHeQ3HPSnNCagb6jqBeFSnXTx0GbuYuk3jA51dQNtsogVAGXCqHsh62QVAl/ga
+# dTfcRaMpIWAc3CPup3x19dDApspmRyOVzXBUtsiCWsIwggZZMIIEQaADAgECAg0B
+# 7BySQN79LkBdfEd0MA0GCSqGSIb3DQEBDAUAMEwxIDAeBgNVBAsTF0dsb2JhbFNp
+# Z24gUm9vdCBDQSAtIFI2MRMwEQYDVQQKEwpHbG9iYWxTaWduMRMwEQYDVQQDEwpH
+# bG9iYWxTaWduMB4XDTE4MDYyMDAwMDAwMFoXDTM0MTIxMDAwMDAwMFowWzELMAkG
+# A1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExMTAvBgNVBAMTKEds
+# b2JhbFNpZ24gVGltZXN0YW1waW5nIENBIC0gU0hBMzg0IC0gRzQwggIiMA0GCSqG
+# SIb3DQEBAQUAA4ICDwAwggIKAoICAQDwAuIwI/rgG+GadLOvdYNfqUdSx2E6Y3w5
+# I3ltdPwx5HQSGZb6zidiW64HiifuV6PENe2zNMeswwzrgGZt0ShKwSy7uXDycq6M
+# 95laXXauv0SofEEkjo+6xU//NkGrpy39eE5DiP6TGRfZ7jHPvIo7bmrEiPDul/bc
+# 8xigS5kcDoenJuGIyaDlmeKe9JxMP11b7Lbv0mXPRQtUPbFUUweLmW64VJmKqDGS
+# O/J6ffwOWN+BauGwbB5lgirUIceU/kKWO/ELsX9/RpgOhz16ZevRVqkuvftYPbWF
+# +lOZTVt07XJLog2CNxkM0KvqWsHvD9WZuT/0TzXxnA/TNxNS2SU07Zbv+GfqCL6P
+# SXr/kLHU9ykV1/kNXdaHQx50xHAotIB7vSqbu4ThDqxvDbm19m1W/oodCT4kDmcm
+# x/yyDaCUsLKUzHvmZ/6mWLLU2EESwVX9bpHFu7FMCEue1EIGbxsY1TbqZK7O/fUF
+# 5uJm0A4FIayxEQYjGeT7BTRE6giunUlnEYuC5a1ahqdm/TMDAd6ZJflxbumcXQJM
+# YDzPAo8B/XLukvGnEt5CEk3sqSbldwKsDlcMCdFhniaI/MiyTdtk8EWfusE/VKPY
+# dgKVbGqNyiJc9gwE4yn6S7Ac0zd0hNkdZqs0c48efXxeltY9GbCX6oxQkW2vV4Z+
+# EDcdaxoU3wIDAQABo4IBKTCCASUwDgYDVR0PAQH/BAQDAgGGMBIGA1UdEwEB/wQI
+# MAYBAf8CAQAwHQYDVR0OBBYEFOoWxmnn48tXRTkzpPBAvtDDvWWWMB8GA1UdIwQY
+# MBaAFK5sBaOTE+Ki5+LXHNbH8H/IZ1OgMD4GCCsGAQUFBwEBBDIwMDAuBggrBgEF
+# BQcwAYYiaHR0cDovL29jc3AyLmdsb2JhbHNpZ24uY29tL3Jvb3RyNjA2BgNVHR8E
+# LzAtMCugKaAnhiVodHRwOi8vY3JsLmdsb2JhbHNpZ24uY29tL3Jvb3QtcjYuY3Js
+# MEcGA1UdIARAMD4wPAYEVR0gADA0MDIGCCsGAQUFBwIBFiZodHRwczovL3d3dy5n
+# bG9iYWxzaWduLmNvbS9yZXBvc2l0b3J5LzANBgkqhkiG9w0BAQwFAAOCAgEAf+KI
+# 2VdnK0JfgacJC7rEuygYVtZMv9sbB3DG+wsJrQA6YDMfOcYWaxlASSUIHuSb99ak
+# DY8elvKGohfeQb9P4byrze7AI4zGhf5LFST5GETsH8KkrNCyz+zCVmUdvX/23oLI
+# t59h07VGSJiXAmd6FpVK22LG0LMCzDRIRVXd7OlKn14U7XIQcXZw0g+W8+o3V5SR
+# GK/cjZk4GVjCqaF+om4VJuq0+X8q5+dIZGkv0pqhcvb3JEt0Wn1yhjWzAlcfi5z8
+# u6xM3vreU0yD/RKxtklVT3WdrG9KyC5qucqIwxIwTrIIc59eodaZzul9S5YszBZr
+# GM3kWTeGCSziRdayzW6CdaXajR63Wy+ILj198fKRMAWcznt8oMWsr1EG8BHHHTDF
+# UVZg6HyVPSLj1QokUyeXgPpIiScseeI85Zse46qEgok+wEr1If5iEO0dMPz2zOpI
+# J3yLdUJ/a8vzpWuVHwRYNAqJ7YJQ5NF7qMnmvkiqK1XZjbclIA4bUaDUY6qD6mxy
+# YUrJ+kPExlfFnbY8sIuwuRwx773vFNgUQGwgHcIt6AvGjW2MtnHtUiH+Pvafnzka
+# rqzSL3ogsfSsqh3iLRSd+pZqHcY8yvPZHL9TTaRHWXyVxENB+SXiLBB+gfkNlKd9
+# 8rUJ9dhgckBQlSDUQ0S++qCV5yBZtnjGpGqqIpswggWDMIIDa6ADAgECAg5F5rsD
+# gzPDhWVI5v9FUTANBgkqhkiG9w0BAQwFADBMMSAwHgYDVQQLExdHbG9iYWxTaWdu
+# IFJvb3QgQ0EgLSBSNjETMBEGA1UEChMKR2xvYmFsU2lnbjETMBEGA1UEAxMKR2xv
+# YmFsU2lnbjAeFw0xNDEyMTAwMDAwMDBaFw0zNDEyMTAwMDAwMDBaMEwxIDAeBgNV
+# BAsTF0dsb2JhbFNpZ24gUm9vdCBDQSAtIFI2MRMwEQYDVQQKEwpHbG9iYWxTaWdu
+# MRMwEQYDVQQDEwpHbG9iYWxTaWduMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
+# CgKCAgEAlQfoc8pm+ewUyns89w0I8bRFCyyCtEjG61s8roO4QZIzFKRvf+kqzMaw
+# iGvFtonRxrL/FM5RFCHsSt0bWsbWh+5NOhUG7WRmC5KAykTec5RO86eJf094YwjI
+# ElBtQmYvTbl5KE1SGooagLcZgQ5+xIq8ZEwhHENo1z08isWyZtWQmrcxBsW+4m0y
+# BqYe+bnrqqO4v76CY1DQ8BiJ3+QPefXqoh8q0nAue+e8k7ttU+JIfIwQBzj/ZrJ3
+# YX7g6ow8qrSk9vOVShIHbf2MsonP0KBhd8hYdLDUIzr3XTrKotudCd5dRC2Q8YHN
+# V5L6frxQBGM032uTGL5rNrI55KwkNrfw77YcE1eTtt6y+OKFt3OiuDWqRfLgnTah
+# b1SK8XJWbi6IxVFCRBWU7qPFOJabTk5aC0fzBjZJdzC8cTflpuwhCHX85mEWP3fV
+# 2ZGXhAps1AJNdMAU7f05+4PyXhShBLAL6f7uj+FuC7IIs2FmCWqxBjplllnA8DX9
+# ydoojRoRh3CBCqiadR2eOoYFAJ7bgNYl+dwFnidZTHY5W+r5paHYgw/R/98wEfmF
+# zzNI9cptZBQselhP00sIScWVZBpjDnk99bOMylitnEJFeW4OhxlcVLFltr+Mm9wT
+# 6Q1vuC7cZ27JixG1hBSKABlwg3mRl5HUGie/Nx4yB9gUYzwoTK8CAwEAAaNjMGEw
+# DgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFK5sBaOT
+# E+Ki5+LXHNbH8H/IZ1OgMB8GA1UdIwQYMBaAFK5sBaOTE+Ki5+LXHNbH8H/IZ1Og
+# MA0GCSqGSIb3DQEBDAUAA4ICAQCDJe3o0f2VUs2ewASgkWnmXNCE3tytok/oR3jW
+# ZZipW6g8h3wCitFutxZz5l/AVJjVdL7BzeIRka0jGD3d4XJElrSVXsB7jpl4FkMT
+# VlezorM7tXfcQHKso+ubNT6xCCGh58RDN3kyvrXnnCxMvEMpmY4w06wh4OMd+tgH
+# M3ZUACIquU0gLnBo2uVT/INc053y/0QMRGby0uO9RgAabQK6JV2NoTFR3VRGHE3b
+# mZbvGhwEXKYV73jgef5d2z6qTFX9mhWpb+Gm+99wMOnD7kJG7cKTBYn6fWN7P9Bx
+# gXwA6JiuDng0wyX7rwqfIGvdOxOPEoziQRpIenOgd2nHtlx/gsge/lgbKCuobK1e
+# bcAF0nu364D+JTf+AptorEJdw+71zNzwUHXSNmmc5nsE324GabbeCglIWYfrexRg
+# emSqaUPvkcdM7BjdbO9TLYyZ4V7ycj7PVMi9Z+ykD0xF/9O5MCMHTI8Qv4aW2Zla
+# tJlXHKTMuxWJU7osBQ/kxJ4ZsRg01Uyduu33H68klQR4qAO77oHl2l98i0qhkHQl
+# p7M+S8gsVr3HyO844lyS8Hn3nIS6dC1hASB+ftHyTwdZX4stQ1LrRgyU4fVmR3l3
+# 1VRbH60kN8tFWk6gREjI2LCZxRWECfbWSUnAZbjmGnFuoKjxguhFPmzWAtcKZ4MF
+# WsmkEDGCA0kwggNFAgEBMG8wWzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2Jh
+# bFNpZ24gbnYtc2ExMTAvBgNVBAMTKEdsb2JhbFNpZ24gVGltZXN0YW1waW5nIENB
+# IC0gU0hBMzg0IC0gRzQCEAEACyAFs5QHYts+NnmUm6kwCwYJYIZIAWUDBAIBoIIB
+# LTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwKwYJKoZIhvcNAQk0MR4wHDAL
+# BglghkgBZQMEAgGhDQYJKoZIhvcNAQELBQAwLwYJKoZIhvcNAQkEMSIEIN/TyF63
+# EnCprHLO+4Dc77Ai64EpxveiaSykxbTPgv1EMIGwBgsqhkiG9w0BCRACLzGBoDCB
+# nTCBmjCBlwQgcl7yf0jhbmm5Y9hCaIxbygeojGkXBkLI/1ord69gXP0wczBfpF0w
+# WzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExMTAvBgNV
+# BAMTKEdsb2JhbFNpZ24gVGltZXN0YW1waW5nIENBIC0gU0hBMzg0IC0gRzQCEAEA
+# CyAFs5QHYts+NnmUm6kwDQYJKoZIhvcNAQELBQAEggGAnC8eyfedflV/gMWxF3vH
+# tLSrMVsiHW5+P2hQfYqc2WskdP2RgHNcEWZtKZ/p8MdmocW9SbuxqBOH7i1L7aUZ
+# 2uPOsZLCP/41oZKqIgJfSfWrf+8V9rAaUbfK5gFBcrJP93J56A//zps16sHy2igS
+# +CmaaGXPXM7tZOsRcnJ4zeUKS8/d8EDkAyMv7E0AbHdYIGAiTGltiOFRt+jbWbBz
+# GirlMGpFlrT606PRO2day+rzMocM2aHNjQNfvoQCf00qF17Kj85Fwr68X8uwdPJD
+# 6TcLBxTZ2go7EjrGzLja3L2OE/Y4mLcQJjBC/2wEMfs1OdLpHh5HsD800BSgnMDx
+# 3J3/0A58HZwF1Evvv6SS/4VUowx6IQ3NbTP80ozfFa5cjAXX/AcpZnH4FA/mlnFA
+# vKsVDsUYzLURB7k03ba8S3X4mbvlFIzHbZ9NQI+qd7HBVELn240nk5B7pR+kE4uJ
+# BzP/47Da+/aP367pPEhqEb2yA60ykV9mwr2LKm1LGPmA
+# SIG # End signature block
