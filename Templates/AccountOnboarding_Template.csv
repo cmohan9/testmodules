@@ -1,0 +1,3 @@
+Region,Environment,Technology,AccessType,Tier,Team,Flavour,AppTower,PlatformAccountType,RotationPolicy,Vendor,Exception,SourcePlatformID,AccountUserName,Address,SecretType,InitialSecret,RequesterEmail
+OCA,P,WIN,LA,T0,SEC,WIN,AD,LA,RA,,,WinDomainGoldPlatform,svc_win_admin01,dc01.corp.example.com,password,,appowner@example.com
+OCA,P,WIN,LA,T0,SEC,WIN,AD,LA,RA,,,WinDomainGoldPlatform,svc_win_admin02,dc01.corp.example.com,password,,appowner@example.com
