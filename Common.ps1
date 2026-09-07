@@ -17,6 +17,13 @@ $Subdomain         = "XXXXXXXXX"
 $IdentityUrl = "https://$IdentityTenantId.id.cyberark.cloud"
 $PvwaBase    = "https://$Subdomain.privilegecloud.cyberark.cloud/PasswordVault/API"
 
+# In Privilege Cloud, safe members synced from an IdP (Entra/AD) surface as CyberArk Identity
+# "Roles", not as LDAP-directory Groups -- this applies uniformly, including built-in members
+# like "Privileged Cloud Administrators". Add-SafeMember below sends memberType = $SafeMemberType
+# for exactly that reason. This is a best-effort value pending confirmation against your tenant
+# (see Get-SafeMembers / the diagnostic note in the README) -- change it if the real API rejects it.
+$SafeMemberType = "Role"
+
 $MaxRetries       = 4
 $RetryWaitSeconds = 5
 
@@ -79,6 +86,32 @@ function Get-Headers {
 }
 #endregion
 
+#region Error body extraction (works whether this runs under Windows PowerShell 5.1 or PowerShell 7+)
+# PS7's Invoke-RestMethod throws Microsoft.PowerShell.Commands.HttpResponseException, whose
+# .Response is a System.Net.Http.HttpResponseMessage (no .GetResponseStream()); PS5.1's Desktop
+# edition throws System.Net.WebException, whose .Response is an HttpWebResponse (has
+# .GetResponseStream() but no .Content). $_.ErrorDetails.Message is populated by PowerShell
+# itself on BOTH editions whenever the server returned a body, so try that first.
+function Get-ErrorResponseBody {
+    param($ErrorRecord)
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        return $ErrorRecord.ErrorDetails.Message
+    }
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if (-not $resp) { return $null }
+        if ($resp.PSObject.Methods.Name -contains "GetResponseStream") {
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            return $reader.ReadToEnd()
+        }
+        if ($resp.PSObject.Properties.Name -contains "Content") {
+            return $resp.Content.ReadAsStringAsync().Result
+        }
+    } catch {}
+    return $null
+}
+#endregion
+
 #region API helpers (GET/POST/PUT with retry, token-refresh, and redacted logging)
 function Invoke-ApiGet {
     param([string]$Uri)
@@ -92,7 +125,8 @@ function Invoke-ApiGet {
         } catch {
             $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
             $m = $_.Exception.Message
-            if ($s -in @(400, 403, 404, 501)) { Write-Log "GET $Uri -> $s $m (no retry)" WARN; return $null }
+            $respBody = Get-ErrorResponseBody -ErrorRecord $_
+            if ($s -in @(400, 403, 404, 501)) { Write-Log "GET $Uri -> $s $m $respBody (no retry)" WARN; return $null }
             if ($s -eq 401) { Write-Log "401 on GET - refreshing token" WARN; Get-AuthToken; continue }
             if ($a -le $MaxRetries) {
                 $w = if ($s -eq 429) { $RetryWaitSeconds * $a } else { $RetryWaitSeconds }
@@ -127,13 +161,7 @@ function Invoke-ApiWrite {
         } catch {
             $s = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
             $m = $_.Exception.Message
-            $respBody = $null
-            try {
-                if ($_.Exception.Response) {
-                    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                    $respBody = $reader.ReadToEnd()
-                }
-            } catch {}
+            $respBody = Get-ErrorResponseBody -ErrorRecord $_
             if ($s -eq 401) { Write-Log "401 on $Method - refreshing token" WARN; Get-AuthToken; continue }
             if ($s -in @(400, 403, 404, 409, 422)) {
                 Write-Log "$Method $Uri -> $s $m $respBody (no retry)" ERROR
@@ -169,11 +197,12 @@ $PlatformAccountTypeCodes = @("LA", "DA", "LS", "DS", "RT", "SA")
 $PlatformRotationCodes    = @("RM", "RA", "RS")
 $PlatformVendorCodes      = @("W", "T", "D")   # optional
 
-# Safe members added to EVERY safe, in addition to the two derived Safe Manager/User groups below.
-# Replace the placeholder with your actual "BG group" name before running against a real tenant.
+# Safe members added to EVERY safe, in addition to the two derived Safe Manager/User groups
+# below. Replace the placeholder with your actual "BG group" name before running against a real
+# tenant. All of these are CyberArk Identity Roles in Privilege Cloud (see $SafeMemberType above).
 $DefaultSafeMembers = @(
-    @{ MemberName = "Privileged Cloud Administrators"; MemberType = "Group" },
-    @{ MemberName = "REPLACE_WITH_BG_GROUP_NAME"; MemberType = "Group" }
+    @{ MemberName = "Privileged Cloud Administrators" },
+    @{ MemberName = "REPLACE_WITH_BG_GROUP_NAME" }
 )
 
 $FullControlPermissions = @{
@@ -308,13 +337,27 @@ function Get-PlatformByName {
 
 function New-DuplicatedPlatform {
     param([string]$SourcePlatformId, [string]$NewPlatformName)
-    $body = @{ Name = $NewPlatformName; Description = "Auto-onboarded platform (duplicated from $SourcePlatformId)" }
+    # camelCase to match every other endpoint on this tenant's API (Safes/Accounts calls all use
+    # camelCase and succeeded) -- if this still 400s, check the redacted error body for the exact
+    # field CyberArk rejected and adjust here.
+    $body = @{ name = $NewPlatformName; description = "Auto-onboarded platform (duplicated from $SourcePlatformId)" }
     return Invoke-ApiWrite -Method POST -Uri "$PvwaBase/Platforms/$SourcePlatformId/Duplicate" -Body $body
 }
 
 function Get-SafeByName {
     param([string]$SafeName)
     return Invoke-ApiGet -Uri "$PvwaBase/Safes/$([uri]::EscapeDataString($SafeName))"
+}
+
+# Diagnostic: returns the raw member list of an existing safe, so you can confirm the exact
+# field name/value CyberArk uses for a Role-type member (e.g. "Privileged Cloud Administrators")
+# on THIS tenant, instead of guessing. Run once against any safe that already has such a member:
+#   . .\Common.ps1; Get-AuthToken
+#   (Get-SafeMembers -SafeName "SomeExistingSafeName").value | ConvertTo-Json -Depth 5
+# Look at the entry for "Privileged Cloud Administrators" and check its memberType/searchIn.
+function Get-SafeMembers {
+    param([string]$SafeName)
+    return Invoke-ApiGet -Uri "$PvwaBase/Safes/$([uri]::EscapeDataString($SafeName))/Members"
 }
 
 function New-Safe {
@@ -329,13 +372,14 @@ function New-Safe {
     return Invoke-ApiWrite -Method POST -Uri "$PvwaBase/Safes" -Body $body
 }
 
-# 409 (member already exists) is treated as non-fatal by callers; 404 means the AD group/user
-# hasn't been provisioned/synced yet and must be created before this safe can be finished.
+# 409 (member already exists) is treated as non-fatal by callers; 404 means the Role/user hasn't
+# been provisioned/synced yet and must be created before this safe can be finished.
 function Add-SafeMember {
-    param([string]$SafeName, [string]$MemberName, [hashtable]$Permissions)
+    param([string]$SafeName, [string]$MemberName, [hashtable]$Permissions, [string]$SearchIn = "Vault", [string]$MemberType = $SafeMemberType)
     $body = @{
         memberName   = $MemberName
-        searchIn     = "Vault"
+        searchIn     = $SearchIn
+        memberType   = $MemberType
         permissions  = $Permissions
     }
     $result = Invoke-ApiWrite -Method POST -Uri "$PvwaBase/Safes/$([uri]::EscapeDataString($SafeName))/Members" -Body $body
