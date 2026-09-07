@@ -1,0 +1,2 @@
+. .\Common.ps1; Get-AuthToken
+(Get-SafeMembers -SafeName "SomeExistingSafeNameThatAlreadyHasPrivilegedCloudAdministrators").value | ConvertTo-Json -Depth 5
