@@ -144,7 +144,11 @@ foreach ($pg in $platformGroups) {
 #endregion
 
 #region Step 2: Safes + Members (one per distinct SafeName)
+# $safeResults gates whether accounts get onboarded -- it reflects whether the SAFE ITSELF
+# exists, not whether every member grant succeeded. $safeMemberWarnings is reporting-only, so a
+# failed AD group grant doesn't block onboarding into an otherwise-good safe.
 $safeResults = @{}
+$safeMemberWarnings = @{}
 foreach ($sg in $safeGroups) {
     $safeName = $sg.Name
     $first    = $sg.Group[0]
@@ -162,6 +166,7 @@ foreach ($sg in $safeGroups) {
         }
         Write-Log "Safe '$safeName' created." SUCCESS
     }
+    $safeResults[$safeName] = $true
 
     $memberOk = $true
     foreach ($m in $DefaultSafeMembers) {
@@ -173,8 +178,8 @@ foreach ($sg in $safeGroups) {
     $r2 = Add-SafeMember -SafeName $safeName -MemberName $first.SafeUserGroup -Permissions $SafeUserPermissions
     if (-not $r2.Success -and $r2.StatusCode -ne 409) { $memberOk = $false }
 
-    $safeResults[$safeName] = $memberOk
-    if (-not $memberOk) { Write-Log "One or more safe members failed on '$safeName' -- see errors above. Its accounts will still be attempted." WARN }
+    $safeMemberWarnings[$safeName] = -not $memberOk
+    if (-not $memberOk) { Write-Log "One or more safe members failed on '$safeName' -- see errors above. Its accounts will still be onboarded; fix the member grant(s) separately." WARN }
 }
 #endregion
 
@@ -185,13 +190,16 @@ foreach ($p in $planItems) {
     Write-Log "--- Account: $($p.AccountUserName)@$($p.Address) in safe '$($p.SafeName)' ---" SECTION
 
     if (-not $platformResults[$p.PlatformName]) {
+        Write-Log "Skipping account '$($p.AccountUserName)' -- platform '$($p.PlatformName)' failed earlier in this run." WARN
         $results.Add([pscustomobject]@{ RowNum = $p.RowNum; SafeName = $p.SafeName; PlatformName = $p.PlatformName; AccountUserName = $p.AccountUserName; AccountId = ""; VerifyStatus = ""; ReconcileStatus = ""; Status = "Skipped"; Reason = "Platform creation failed" })
         continue
     }
     if (-not $safeResults.ContainsKey($p.SafeName) -or -not $safeResults[$p.SafeName]) {
-        $results.Add([pscustomobject]@{ RowNum = $p.RowNum; SafeName = $p.SafeName; PlatformName = $p.PlatformName; AccountUserName = $p.AccountUserName; AccountId = ""; VerifyStatus = ""; ReconcileStatus = ""; Status = "Skipped"; Reason = "Safe creation/members failed" })
+        Write-Log "Skipping account '$($p.AccountUserName)' -- safe '$($p.SafeName)' creation failed earlier in this run." WARN
+        $results.Add([pscustomobject]@{ RowNum = $p.RowNum; SafeName = $p.SafeName; PlatformName = $p.PlatformName; AccountUserName = $p.AccountUserName; AccountId = ""; VerifyStatus = ""; ReconcileStatus = ""; Status = "Skipped"; Reason = "Safe creation failed" })
         continue
     }
+    $memberWarning = if ($safeMemberWarnings[$p.SafeName]) { "Safe member grant(s) failed -- see log" } else { "" }
 
     $acctResult = New-Account -SafeName $p.SafeName -PlatformId $p.PlatformName -UserName $p.AccountUserName `
         -Address $p.Address -SecretType $p.SecretType -InitialSecret $p.InitialSecret
@@ -217,7 +225,7 @@ foreach ($p in $planItems) {
         RowNum = $p.RowNum; SafeName = $p.SafeName; PlatformName = $p.PlatformName
         AccountUserName = $p.AccountUserName; AccountId = $accountId
         VerifyStatus = $verifyResult.Status; ReconcileStatus = $reconcileResult.Status
-        Status = $status; Reason = ""
+        Status = $status; Reason = $memberWarning
     })
 
     if ($status -ne "Success") { Write-Log "Account '$($p.AccountUserName)' finished with status '$status' (verify=$($verifyResult.Status), reconcile=$($reconcileResult.Status))." WARN }
@@ -231,10 +239,10 @@ Write-Log "===================================================" SECTION
 Write-Log " Run complete. Results written to $resultsFile" SECTION
 Write-Log "===================================================" SECTION
 
-$failCount = @($results | Where-Object { $_.Status -ne "Success" }).Count
+$failCount = @($results | Where-Object { $_.Status -ne "Success" -or $_.Reason }).Count
 if ($failCount -gt 0) {
     Write-Host ""
     Write-Host "$failCount item(s) need attention:" -ForegroundColor Yellow
-    $results | Where-Object { $_.Status -ne "Success" } | Format-Table RowNum, SafeName, AccountUserName, Status, Reason -AutoSize
+    $results | Where-Object { $_.Status -ne "Success" -or $_.Reason } | Format-Table RowNum, SafeName, AccountUserName, Status, Reason -AutoSize
 }
 #endregion
