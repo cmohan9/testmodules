@@ -1,5 +1,29 @@
 # User Guide for Raising a Request — CyberArk Endpoint Privilege Manager (EPM)
 
+<span style="color:red"><strong>Note:</strong></span> This article follows the KB Articles Creation, Standards and KB Articles Attachment guidelines (per KB0012505). A new revision history entry must be added every time this article's content is modified — see the **Revision History** table below.
+
+---
+
+## Revision History
+
+| Version | Date (mm/dd/yyyy) | Description of Change | Author |
+|---|---|---|---|
+| 1.0 | 09/10/2026 | Initial document | cmohan9@deloitte.com |
+| 1.1 | 09/10/2026 | Added FAQ section covering AD groups, catalog service selection, the Describe the Issue field, EPM policy explanation, approval on changed requests, group-based requests, and the requirement gathering form | cmohan9@deloitte.com |
+| 1.2 | 09/10/2026 | Converted the article to Markdown format with structured headers, callouts, and tables for readability | cmohan9@deloitte.com |
+| 1.3 | 09/10/2026 | Reorganized the FAQ into a systematic learning-flow order (22 questions); removed emoji usage throughout the article | cmohan9@deloitte.com |
+| 1.4 | 09/10/2026 | Aligned article structure to KB Creation and Standards template: added Revision History, Introduction, and Article Metadata sections; applied a/b/c and i/ii/iii numbering; formatted notes in red/bold | cmohan9@deloitte.com |
+
+---
+
+## Introduction
+
+This article provides guidance for users in the **Japan (JP) Region** on how to raise a ServiceNow catalog request for CyberArk Endpoint Privilege Manager (EPM) — either **Temporary Administrator Access (JIT)** or **EPM Policy Creation/Modification** — and includes a Frequently Asked Questions (FAQ) section addressing common user questions about EPM, when to use each request type, and how to complete the request correctly.
+
+**Applicable region(s):** Japan (JP) only. The Request/Manage Admin Rights catalog contains options for other regions as well; JP users must use only the option identified in this article.
+
+---
+
 ## Raise a ServiceNow Request — Request/Manage Admin Rights
 
 Use the link below to access the **Request/Manage Admin Rights** Service Catalog to request:
@@ -11,7 +35,7 @@ through CyberArk Endpoint Privilege Manager (EPM).
 
 > **Navigation:** All Catalogs → GITO Catalog → Security → **Request/Manage Admin Rights**
 
-> **Important:** Under **Services Required**, users must select **"Request assistance with CyberArk Endpoint Privilege Manager (EPM)"** only. This option is specifically for the **Japan (JP) Region**. The remaining options in the catalog are intended for other regions and **must not** be used for JP EPM requests.
+<span style="color:red"><strong>Important:</strong></span> Under **Services Required**, users must select **"Request assistance with CyberArk Endpoint Privilege Manager (EPM)"** only. This option is specifically for the **Japan (JP) Region**. The remaining options in the catalog are intended for other regions and **must not** be used for JP EPM requests.
 
 ---
 
@@ -19,15 +43,15 @@ through CyberArk Endpoint Privilege Manager (EPM).
 
 Request temporary administrator access when device-wide elevated privileges are required to perform approved business activities on your endpoint.
 
-### Step 1 — Select the Service
+### a. Select the Service
 
 Under **Services Required**, select:
 
 > `Request assistance with CyberArk Endpoint Privilege Manager (EPM)`
 
-### Step 2 — Provide the Required Information
+### b. Provide the Required Information
 
-**1. Business Justification**
+**i. Business Justification**
 
 Clearly explain:
 
@@ -36,7 +60,7 @@ Clearly explain:
 - The task or activity being performed.
 - Any project, operational, or application-related requirements that necessitate elevated privileges.
 
-**2. Description**
+**ii. Description**
 
 Provide additional details, including:
 
@@ -45,7 +69,7 @@ Provide additional details, including:
 - Expected duration of access (**maximum 3 hours**).
 - Any relevant supporting information, such as application name, installation details, or business deadlines.
 
-**3. Describe the Issue**
+**iii. Describe the Issue**
 
 Please enter the following **exactly** as shown:
 
@@ -53,15 +77,15 @@ Please enter the following **exactly** as shown:
 Requesting JP Temp Admin Access (JIT)
 ```
 
-> **Note:** Ensure sufficient business justification and supporting details are provided to avoid delays during the approval and fulfillment process.
+<span style="color:red"><strong>Note:</strong></span> Ensure sufficient business justification and supporting details are provided to avoid delays during the approval and fulfillment process.
 
-**4. Submit the request.**
+**iv. Submit the request.**
 
-### Approval & Fulfillment Process
+### c. Approval & Fulfillment Process
 
-1. Request is submitted through Quest.
-2. Request is routed to the requester's manager for approval.
-3. Once approved, the request is assigned to the CyberArk EPM Team for review and processing.
+i. Request is submitted through Quest.
+ii. Request is routed to the requester's manager for approval.
+iii. Once approved, the request is assigned to the CyberArk EPM Team for review and processing.
 
 > **SLA:** Temporary Administrator Access (JIT) is processed **within 4 hours** of receipt after manager approval.
 
@@ -71,15 +95,15 @@ Requesting JP Temp Admin Access (JIT)
 
 Request creation of a new EPM elevation policy or modification of an existing policy for application elevation requirements.
 
-### Step 1 — Select the Service
+### a. Select the Service
 
 Under **Services Required**, select:
 
 > `Request assistance with CyberArk Endpoint Privilege Manager (EPM)`
 
-### Step 2 — Provide the Required Information
+### b. Provide the Required Information
 
-**1. Business Justification**
+**i. Business Justification**
 
 Clearly provide the following details:
 
@@ -89,7 +113,7 @@ Clearly provide the following details:
 - The number of users requiring elevation.
 - Any relevant approvals, project references, or supporting business requirements.
 
-**2. Description**
+**ii. Description**
 
 Provide complete application and policy details, including:
 
@@ -101,7 +125,7 @@ Provide complete application and policy details, including:
 - User Group, Department, or Team requiring the policy
 - Any supporting documentation, screenshots, or additional information that may assist in evaluating the request
 
-**3. Describe the Issue**
+**iii. Describe the Issue**
 
 Please enter the following **exactly** as shown:
 
@@ -109,21 +133,21 @@ Please enter the following **exactly** as shown:
 Request for JP EPM Policy Creation/Modification
 ```
 
-**4. Submit the request.**
+**iv. Submit the request.**
 
-### Approval & Fulfillment Process
+### c. Approval & Fulfillment Process
 
-1. Request is submitted through Quest.
-2. Request is routed to the requester's manager for approval.
-3. Once approved, the request is assigned to the CyberArk EPM Team for review and processing.
+i. Request is submitted through Quest.
+ii. Request is routed to the requester's manager for approval.
+iii. Once approved, the request is assigned to the CyberArk EPM Team for review and processing.
 
 > **SLA:** Policy Creation/Modification is processed **within 3 business days**, provided all required information and relevant details are included in the request.
 
 **Processing may be delayed if:**
 
-1. Additional information or clarification is required.
-2. There is a delay in responses from the requestor.
-3. Further analysis, validation, or review is needed before implementation.
+i. Additional information or clarification is required.
+ii. There is a delay in responses from the requestor.
+iii. Further analysis, validation, or review is needed before implementation.
 
 ---
 
@@ -250,6 +274,29 @@ Yes. Use the Requirement Gathering Form `[attached/linked to this catalog]` to c
 
 ---
 
-**Placeholders to update before publishing:**
-- Q19 — UAM team catalog link for AD group creation
+## ServiceNow Article Metadata
+
+*Confirm each field below against the values actually available in the SNOW ticket fields/Knowledge form before publishing (per KB Creation and Standards, item g).*
+
+| Field | Value |
+|---|---|
+| Knowledge Base | G_IT_KM |
+| Tower Name | `[Insert Tower Name]` |
+| Category | Security *(confirm against available Category options)* |
+| Subcategory | Privileged Access Management *(confirm against available Subcategory options)* |
+| Business Service | CyberArk Endpoint Privilege Manager (EPM) *(confirm against available Business Service options)* |
+| Language | English |
+| Region(s) | Japan (JP) |
+| Can Read | ITIL-role agents; JP region end users (this article is intended for end-user self-service) |
+| Cannot Read | `[Define if view needs to be restricted/segregated by region]` |
+| Meta Words (Search Words) | EPM, CyberArk, Endpoint Privilege Manager, JIT, Temporary Admin Access, Policy Creation, Policy Modification, Elevation, Admin Rights, ServiceNow Catalog, Japan, JP, AD Group |
+| Resolver Group | CyberArk EPM Team *(if the EPM process described here does not resolve the issue, route per your team's standard assignment group)* |
+
+---
+
+**Formatting note for transfer to the official SNOW KB template:** This Markdown file is a content source. When pasting into the official KB Word template for upload to ServiceNow, apply Candara or Tahoma font throughout, title font size 14–16, general content font size 12, and confirm the numbering (1/2/3, a/b/c, i/ii/iii) carries over correctly, per the KB Creation and Standards article.
+
+**Open placeholders to resolve before publishing:**
+- Q19 / ServiceNow Article Metadata — UAM team catalog link for AD group creation
 - Q22 — Requirement Gathering Form attachment/link
+- ServiceNow Article Metadata — Tower Name, Cannot Read, and confirmed Category/Subcategory/Business Service values
