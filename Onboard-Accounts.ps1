@@ -119,6 +119,8 @@ Write-Log "User confirmed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -- procee
 Get-AuthToken
 
 #region Step 1: Platforms (one duplicate per distinct PlatformName/SourcePlatformID pair)
+# Each entry: @{ Success = bool; PlatformId = <the ID to actually pass to New-Account> }
+# PlatformId is NOT assumed to equal $platformName -- see Resolve-NewPlatformId in Common.ps1.
 $platformResults = @{}
 foreach ($pg in $platformGroups) {
     $parts = $pg.Name -split ', ', 2
@@ -129,15 +131,19 @@ foreach ($pg in $platformGroups) {
     $existing = Get-PlatformByName -PlatformId $platformName
     if ($existing) {
         Write-Log "Platform '$platformName' already exists -- reusing." INFO
-        $platformResults[$platformName] = $true
+        $existingId = if ($existing.PSObject.Properties.Name -contains "PlatformID") { $existing.PlatformID } else { $existing.general.id }
+        if (-not $existingId) { $existingId = $platformName }
+        $platformResults[$platformName] = @{ Success = $true; PlatformId = [string]$existingId }
         continue
     }
 
     $result = New-DuplicatedPlatform -SourcePlatformId $sourceId -NewPlatformName $platformName
-    $platformResults[$platformName] = $result.Success
     if ($result.Success) {
-        Write-Log "Platform '$platformName' created by duplicating '$sourceId'." SUCCESS
+        $resolvedId = Resolve-NewPlatformId -DuplicateResponseData $result.Data -NewPlatformName $platformName
+        $platformResults[$platformName] = @{ Success = $true; PlatformId = $resolvedId }
+        Write-Log "Platform '$platformName' created by duplicating '$sourceId' (resolved platform ID for onboarding: '$resolvedId')." SUCCESS
     } else {
+        $platformResults[$platformName] = @{ Success = $false; PlatformId = $null }
         Write-Log "Failed to duplicate platform '$platformName' from '$sourceId': $($result.Error)" ERROR
     }
 }
@@ -189,7 +195,8 @@ $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 foreach ($p in $planItems) {
     Write-Log "--- Account: $($p.AccountUserName)@$($p.Address) in safe '$($p.SafeName)' ---" SECTION
 
-    if (-not $platformResults[$p.PlatformName]) {
+    $platformInfo = $platformResults[$p.PlatformName]
+    if (-not $platformInfo -or -not $platformInfo.Success) {
         Write-Log "Skipping account '$($p.AccountUserName)' -- platform '$($p.PlatformName)' failed earlier in this run." WARN
         $results.Add([pscustomobject]@{ RowNum = $p.RowNum; SafeName = $p.SafeName; PlatformName = $p.PlatformName; AccountUserName = $p.AccountUserName; AccountId = ""; VerifyStatus = ""; ReconcileStatus = ""; Status = "Skipped"; Reason = "Platform creation failed" })
         continue
@@ -201,7 +208,7 @@ foreach ($p in $planItems) {
     }
     $memberWarning = if ($safeMemberWarnings[$p.SafeName]) { "Safe member grant(s) failed -- see log" } else { "" }
 
-    $acctResult = New-Account -SafeName $p.SafeName -PlatformId $p.PlatformName -UserName $p.AccountUserName `
+    $acctResult = New-Account -SafeName $p.SafeName -PlatformId $platformInfo.PlatformId -UserName $p.AccountUserName `
         -Address $p.Address -SecretType $p.SecretType -InitialSecret $p.InitialSecret
     if (-not $acctResult.Success) {
         Write-Log "Failed to onboard account '$($p.AccountUserName)': $($acctResult.Error)" ERROR
