@@ -1,114 +1,64 @@
 <#
 
-.\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892"
 
-.\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892" -Month 2026-08
-
-
-.\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892" -StartDate 2026-09-01 -EndDate 2026-09-30
+.\EPM_Raw_Support_Case_Steps.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892"
 
 .SYNOPSIS
-    Downloads ALL EPM events for a specific computer, for a given month (or date
-    range), from CyberArk EPM (cloud).
+    Runs the exact 3-step EPM API flow the support team asked for, and prints/saves
+    the RAW API responses (as-is) so they can be pasted straight into the support case.
 
 .DESCRIPTION
-    Built against the OFFICIAL EPM REST API docs (docs.cyberark.com/epm/latest/en/content/webservices):
+    This is deliberately a thin, literal translation of the 3 curl steps support
+    originally requested - it does NOT parse, reshape, or "fix" the filter logic.
+    If a filter field (e.g. computerName) isn't accepted by the API, this script
+    will show you the raw error response instead of silently working around it,
+    which is exactly what support needs to see.
 
-      1. EPM authentication
-         POST https://<LoginServer>/EPM/API/Auth/EPM/Logon
-         Docs: .../webservices/serverauthentication.htm
-         -> Returns ManagerURL (the tenant's real API host) + EPMAuthenticationResult (token)
+      Step 1 - Login and obtain the token
+        POST https://<LoginServer>/EPM/API/Auth/EPM/Logon
 
-      2. Get sets list
-         GET https://<ManagerURL>/EPM/API/Sets
-         Docs: .../webservices/getsetslist.htm
+      Step 2 - Get Set IDs
+        GET https://<ManagerURL>/EPM/API/Sets
 
-      3. Get endpoints (resolve the computer name -> its stable agentId)
-         POST https://<ManagerURL>/EPM/API/Sets/<SetId>/Endpoints/search
-         Docs: .../webservices/endpoint-apis/get-endpoints.htm
-         The endpoint object's "legacyId" is the same identifier the deprecated
-         "Get computers" API called "AgentId" - it's what the events API's
-         "agentId" filter expects.
+      Step 3 - Get the JIT / ManualRequest events for a Set
+        POST https://<ManagerURL>/EPM/API/Sets/<SetId>/Events/Aggregations/Search
+        Body filter (as requested):
+          eventType EQ "ManualRequest" AND computerName CONTAINS "<ComputerName>"
 
-      4. Get detailed raw events (per-occurrence, not aggregated), filtered
-         server-side by agentId + date range (and optionally eventType)
-         POST https://<ManagerURL>/EPM/API/Sets/<SetId>/Events/Search
-         Docs: .../webservices/getdetailedrawevents.htm
-
-    WHY agentId AND NOT computerName:
-      Neither Events/Search nor Events/Aggregations/Search supports a
-      "computerName" filter server-side. The documented filter fields are:
-      aggregatedBy, eventType, fileName, fileLocation, sourceName, publisher,
-      productName, policyName, hash, eventDate, justification,
-      justificationEmail, justificationType, jitRequestInterval,
-      applicationType, userIsAdmin, agentId, user, fileDescription.
-      "agentId" (IN operator) IS documented and lets EPM do the filtering for
-      us, which is far more efficient than pulling a whole set's events for a
-      month and filtering client-side. If the account calling this script
-      lacks permission to call Get Endpoints, the script automatically falls
-      back to pulling all events in the date range and filtering client-side
-      on the event's "lastEventComputerName" field instead.
-
-    ALL EVENT TYPES BY DEFAULT:
-      Leave -EventType unset to get everything (ThreatProtection, application
-      events - ElevationRequest/ManualRequest/Trust/Installation/Launch/
-      Block/RestrictAccess/DetectAccess/Ransomware -, and Skipped). Pass
-      -EventType to narrow it down (e.g. -EventType ManualRequest,ElevationRequest).
+    NOTE: The session token from Step 1 is redacted before it's printed or saved -
+    it's a live bearer credential for your EPM session and shouldn't end up in a
+    ticketing system in plaintext. Everything else is shown exactly as returned.
 
 .PARAMETER LoginServer
-    The EPM dispatcher / login host you normally sign in through, e.g. login.epm.cyberark.com
+    The EPM dispatcher / login host, e.g. login.epm.cyberark.com
 
 .PARAMETER Credential
     PSCredential for the EPM user. If omitted, you'll be prompted securely.
 
 .PARAMETER ApplicationID
-    Free-text string identifying the caller to EPM (shows up in EPM's own logs).
-
-.PARAMETER ComputerName
-    Substring to match against the endpoint / computer name, e.g. "17892".
-
-.PARAMETER Month
-    Calendar month to pull, format "yyyy-MM" (e.g. "2026-09"). Ignored if
-    -StartDate/-EndDate are supplied. Defaults to the CURRENT month if none
-    of -Month, -StartDate, -EndDate are given.
-
-.PARAMETER StartDate
-.PARAMETER EndDate
-    Optional explicit UTC date bounds (yyyy-MM-dd or full ISO-8601). Overrides
-    -Month when both are supplied. Supply both together.
-
-.PARAMETER EventType
-    Optional. One or more EPM event types (ManualRequest, ElevationRequest,
-    Trust, Installation, Launch, Block, RestrictAccess, DetectAccess,
-    Ransomware, Skipped, AttackAttempt, AttackBlock,
-    SuspiciousActivityAttempt, SuspiciousActivityBlock). Default: none
-    specified = ALL event types are returned.
-
-.PARAMETER JitOnly
-    If set, additionally restricts results to justificationType EQ 1
-    (JIT elevation requests only, vs. justificationType 2 = "other request").
-    Only meaningful alongside ManualRequest / ElevationRequest events.
+    Free-text string identifying the caller to EPM.
 
 .PARAMETER SetId
-    Optional. If you already know the Set ID, skip the interactive picker.
+    The Set ID to query in Step 3. If omitted, the script prints Step 2's raw
+    output and asks you to paste in the Set ID you want to use for Step 3.
 
-.PARAMETER OutCsv
-    Optional path for the CSV export. If omitted, a file named
-    EPM_AllEvents_<ComputerName>_<range>.csv is written to the current folder.
+.PARAMETER ComputerName
+    Value used in the Step 3 filter's computerName CONTAINS clause.
+
+.PARAMETER EventType
+    Value used in the Step 3 filter's eventType EQ clause. Default: ManualRequest
+
+.PARAMETER Endpoint
+    "Aggregations" (default) hits Events/Aggregations/Search, matching the
+    original request. "Raw" hits Events/Search instead, which returns one row
+    per occurrence and supports more filter fields (e.g. agentId, user).
+
+.PARAMETER TranscriptPath
+    Optional path to save all 3 raw responses into one text file for easy
+    pasting into the ticket. Defaults to .\EPM_Support_Case_RawOutput_<timestamp>.txt
 
 .EXAMPLE
-    # All events for computer "17892" for the current month, auto-saved to CSV
-    .\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892"
-
-.EXAMPLE
-    # All events for a specific month
-    .\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892" -Month 2026-08
-
-.EXAMPLE
-    # Just JIT requests, explicit date range, explicit set, explicit CSV path
-    .\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892" `
-        -SetId "2195bd87-36ec-4ae0-8f35-661d0254e441" -StartDate 2026-09-01 -EndDate 2026-09-30 `
-        -EventType ManualRequest,ElevationRequest -JitOnly -OutCsv .\jit_only.csv
+    .\EPM_Raw_Support_Case_Steps.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892"
 #>
 
 [CmdletBinding()]
@@ -120,327 +70,204 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
 
     [Parameter()]
-    [string]$ApplicationID = "PS-EPM-EventExport",
-
-    [Parameter(Mandatory)]
-    [string]$ComputerName,
-
-    [Parameter()]
-    [string]$Month,
-
-    [Parameter()]
-    [string]$StartDate,
-
-    [Parameter()]
-    [string]$EndDate,
-
-    [Parameter()]
-    [string[]]$EventType = @(),
-
-    [Parameter()]
-    [switch]$JitOnly,
+    [string]$ApplicationID = "PS-EPM-SupportCase",
 
     [Parameter()]
     [string]$SetId,
 
     [Parameter()]
-    [string]$OutCsv
+    [string]$ComputerName = "17892",
+
+    [Parameter()]
+    [string]$EventType = "ManualRequest",
+
+    [Parameter()]
+    [ValidateSet("Aggregations", "Raw")]
+    [string]$Endpoint = "Aggregations",
+
+    [Parameter()]
+    [string]$TranscriptPath
 )
 
-# Ensure TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 function Get-HostOnly {
-    # EPM sometimes returns ManagerURL WITH a scheme (e.g. "https://na206.epm.cyberark.com")
-    # and callers might pass -LoginServer WITH a scheme too. Normalize to a bare host so we
-    # never accidentally build "https://https://...".
     param([string]$UrlOrHost)
     $h = $UrlOrHost.Trim()
     $h = $h -replace '^https?://', ''
-    $h = $h.TrimEnd('/')
-    return $h
+    return $h.TrimEnd('/')
 }
 
-function Convert-ToIsoDate {
-    param([string]$DateString)
-    if ([string]::IsNullOrWhiteSpace($DateString)) { return $null }
-    $dt = [datetime]::Parse($DateString, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal)
-    return $dt.ToString("yyyy-MM-ddTHH:mm:ssZ")
-}
+# Calls the API and returns the RAW response body as text, whether the call
+# succeeded or failed, plus the HTTP status code.
+function Invoke-EpmRaw {
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Body
+    )
 
-function Get-MonthRange {
-    param([string]$MonthString)
-    $first = [datetime]::ParseExact("$MonthString-01", "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
-    $first = [datetime]::SpecifyKind($first, [DateTimeKind]::Utc)
-    $lastInstant = $first.AddMonths(1).AddSeconds(-1)
+    $statusCode = $null
+    $rawBody    = $null
+
+    try {
+        if ($Body) {
+            $resp = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $Headers -Body $Body -UseBasicParsing -ErrorAction Stop
+        }
+        else {
+            $resp = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $Headers -UseBasicParsing -ErrorAction Stop
+        }
+        $statusCode = [int]$resp.StatusCode
+        $rawBody    = $resp.Content
+    }
+    catch {
+        $ex = $_.Exception
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $rawBody = $_.ErrorDetails.Message
+        }
+        elseif ($ex.Response -and ($ex.Response.PSObject.Methods.Name -contains 'GetResponseStream')) {
+            try {
+                $stream = $ex.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $rawBody = $reader.ReadToEnd()
+            }
+            catch { $rawBody = $ex.Message }
+        }
+        else {
+            $rawBody = $ex.Message
+        }
+
+        if ($ex.Response -and $ex.Response.StatusCode) {
+            $statusCode = [int]$ex.Response.StatusCode
+        }
+        else {
+            $statusCode = "ERROR"
+        }
+    }
+
     return [PSCustomObject]@{
-        Start = $first.ToString("yyyy-MM-ddTHH:mm:ssZ")
-        End   = $lastInstant.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        StatusCode = $statusCode
+        RawBody    = $rawBody
     }
 }
 
-# ---------------------------------------------------------------------------
-# Resolve the date range (explicit Start/End wins; otherwise -Month;
-# otherwise default to the current month)
-# ---------------------------------------------------------------------------
-if ($StartDate -or $EndDate) {
-    if (-not ($StartDate -and $EndDate)) {
-        throw "Please supply BOTH -StartDate and -EndDate together, or use -Month instead."
-    }
-    $startIso   = Convert-ToIsoDate $StartDate
-    $endIso     = Convert-ToIsoDate $EndDate
-    $rangeLabel = "$StartDate_to_$EndDate"
-}
-else {
-    if (-not $Month) { $Month = (Get-Date).ToString("yyyy-MM") }
-    $range      = Get-MonthRange -MonthString $Month
-    $startIso   = $range.Start
-    $endIso     = $range.End
-    $rangeLabel = $Month
+function Format-Pretty {
+    param([string]$Text)
+    try { return ($Text | ConvertFrom-Json | ConvertTo-Json -Depth 10) }
+    catch { return $Text }
 }
 
-Write-Host "Date range: $startIso  to  $endIso" -ForegroundColor DarkGray
+$transcript = New-Object System.Collections.Generic.List[string]
+function Add-Transcript {
+    param([string]$Title, [string]$Text)
+    $transcript.Add("===== $Title =====")
+    $transcript.Add($Text)
+    $transcript.Add("")
+}
 
-# ---------------------------------------------------------------------------
-# STEP 1 - Login and obtain the token + the real API host (ManagerURL)
-# ---------------------------------------------------------------------------
 $LoginServer = Get-HostOnly $LoginServer
-
 if (-not $Credential) {
     $Credential = Get-Credential -Message "Enter your EPM username and password"
 }
 $plainPassword = [System.Net.NetworkCredential]::new('', $Credential.Password).Password
 
+# ---------------------------------------------------------------------------
+# step1 - login and obtain the token
+# ---------------------------------------------------------------------------
 $loginBody = @{
     Username      = $Credential.UserName
     Password      = $plainPassword
     ApplicationID = $ApplicationID
 } | ConvertTo-Json
 
-Write-Host "Logging on to EPM via $LoginServer ..." -ForegroundColor Cyan
+Write-Host "`n=== STEP 1: Login ===" -ForegroundColor Cyan
+$loginResult = Invoke-EpmRaw -Method Post `
+    -Uri "https://$LoginServer/EPM/API/Auth/EPM/Logon" `
+    -Headers @{ "Content-Type" = "application/json" } `
+    -Body $loginBody
+
+$loginPretty = Format-Pretty $loginResult.RawBody
+
+# Redact the token before printing/saving
+$loginPrettyRedacted = $loginPretty -replace '("EPMAuthenticationResult"\s*:\s*")[^"]*(")', '$1<REDACTED>$2'
+
+Write-Host "HTTP Status: $($loginResult.StatusCode)"
+Write-Host $loginPrettyRedacted
+Add-Transcript -Title "STEP 1: POST /EPM/API/Auth/EPM/Logon  (HTTP $($loginResult.StatusCode))" -Text $loginPrettyRedacted
+
+# Parse quietly (not printed) just enough to make Steps 2 & 3 work
 try {
-    $loginResponse = Invoke-RestMethod -Method Post `
-        -Uri "https://$LoginServer/EPM/API/Auth/EPM/Logon" `
-        -Headers @{ "Content-Type" = "application/json" } `
-        -Body $loginBody
+    $loginObj = $loginResult.RawBody | ConvertFrom-Json
 }
 catch {
-    throw "EPM logon failed: $($_.Exception.Message)"
+    throw "Step 1 did not return valid JSON - see the raw output above. Cannot continue to Step 2/3."
 }
 
-if (-not $loginResponse.EPMAuthenticationResult) {
-    throw "Logon call succeeded but no token was returned. Response: $($loginResponse | ConvertTo-Json -Depth 5)"
+if (-not $loginObj.EPMAuthenticationResult) {
+    throw "Step 1 succeeded but no token was returned - see the raw output above. Cannot continue to Step 2/3."
 }
 
-$token      = $loginResponse.EPMAuthenticationResult
-$managerUrl = $loginResponse.ManagerURL
-if (-not $managerUrl) {
-    Write-Warning "No ManagerURL returned by the logon call - falling back to $LoginServer for API calls."
-    $managerUrl = $LoginServer
-}
-$managerUrl = Get-HostOnly $managerUrl
-
-if ($loginResponse.IsPasswordExpired) {
-    Write-Warning "EPM reports this account's password is expired - the token may still work, but log in via the console soon."
-}
+$token      = $loginObj.EPMAuthenticationResult
+$managerUrl = Get-HostOnly ($loginObj.ManagerURL)
+if (-not $managerUrl) { $managerUrl = $LoginServer }
 
 $authHeaders = @{
     "Authorization" = "basic $token"
     "Content-Type"  = "application/json"
 }
 
-Write-Host "Logged on. Using API host: https://$managerUrl" -ForegroundColor Green
-
 # ---------------------------------------------------------------------------
-# STEP 2 - Get the list of Sets, resolve which Set(s) to query
+# step2 - get set ids
 # ---------------------------------------------------------------------------
-try {
-    $setsResponse = Invoke-RestMethod -Method Get `
-        -Uri "https://$managerUrl/EPM/API/Sets" `
-        -Headers $authHeaders
-}
-catch {
-    throw "Failed to retrieve sets list: $($_.Exception.Message)"
-}
+Write-Host "`n=== STEP 2: Get Set IDs ===" -ForegroundColor Cyan
+$setsResult = Invoke-EpmRaw -Method Get -Uri "https://$managerUrl/EPM/API/Sets" -Headers $authHeaders
+$setsPretty = Format-Pretty $setsResult.RawBody
 
-$sets = $setsResponse.Sets
-if (-not $sets -or $sets.Count -eq 0) {
-    throw "No Sets were returned for this account. Check the account has 'Allow to manage Sets' / view permissions."
-}
+Write-Host "HTTP Status: $($setsResult.StatusCode)"
+Write-Host $setsPretty
+Add-Transcript -Title "STEP 2: GET /EPM/API/Sets  (HTTP $($setsResult.StatusCode))" -Text $setsPretty
 
-if ($SetId) {
-    $targetSets = $sets | Where-Object { $_.Id -eq $SetId }
-    if (-not $targetSets) {
-        throw "SetId '$SetId' was not found among the sets this account can see."
-    }
-}
-elseif ($sets.Count -eq 1) {
-    $targetSets = $sets
-}
-else {
-    Write-Host "`nMultiple sets are visible to this account:" -ForegroundColor Yellow
-    for ($i = 0; $i -lt $sets.Count; $i++) {
-        Write-Host ("  [{0}] {1}  (Id: {2})" -f $i, $sets[$i].Name, $sets[$i].Id)
-    }
-    Write-Host "  [A] Search ALL of the above sets"
-    $choice = Read-Host "`nEnter a number to search one set, or 'A' for all"
-    if ($choice -match '^[Aa]$') {
-        $targetSets = $sets
-    }
-    else {
-        $idx = [int]$choice
-        $targetSets = @($sets[$idx])
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Helper: resolve ComputerName -> agentId(s) via Get Endpoints (documented,
-# efficient, server-side "name CONTAINS" filter), scoped to one Set.
-# ---------------------------------------------------------------------------
-function Resolve-EpmAgentIds {
-    param($ManagerUrl, $Headers, $SetId, $ComputerName)
-
-    $filter = 'name CONTAINS "' + $ComputerName + '"'
-    $offset = 0
-    $limit  = 1000
-    $found  = New-Object System.Collections.Generic.List[object]
-
-    do {
-        $uri  = "https://$ManagerUrl/EPM/API/Sets/$SetId/Endpoints/search?offset=$offset&limit=$limit"
-        $body = @{ filter = $filter } | ConvertTo-Json
-        $resp = Invoke-RestMethod -Method Post -Uri $uri -Headers $Headers -Body $body
-        foreach ($ep in $resp.endpoints) { $found.Add($ep) }
-        $offset += $limit
-    } while ($resp.filteredCount -gt $offset)
-
-    return $found
-}
-
-# Build the common (non-agent) portion of the filter: date range + optional
-# eventType / justificationType restrictions.
-$commonFilterParts = @()
-$commonFilterParts += "eventDate GE `"$startIso`""
-$commonFilterParts += "eventDate LE `"$endIso`""
-if ($EventType.Count -gt 0) {
-    $commonFilterParts += ('eventType IN "' + ($EventType -join '","') + '"')
-}
-if ($JitOnly) {
-    $commonFilterParts += "justificationType EQ 1"
-}
-
-$allMatches   = New-Object System.Collections.Generic.List[object]
-$agentNameMap = @{}
-
-foreach ($set in $targetSets) {
-
-    Write-Host "`nSearching set '$($set.Name)' (Id: $($set.Id)) ..." -ForegroundColor Cyan
-
-    $agentIds = @()
+if (-not $SetId) {
     try {
-        $endpoints = Resolve-EpmAgentIds -ManagerUrl $managerUrl -Headers $authHeaders -SetId $set.Id -ComputerName $ComputerName
-        if ($endpoints.Count -eq 0) {
-            Write-Host "  No endpoint matching '*$ComputerName*' found in this set - skipping." -ForegroundColor DarkGray
-            continue
+        $setsObj = $setsResult.RawBody | ConvertFrom-Json
+        if ($setsObj.Sets -and $setsObj.Sets.Count -gt 0) {
+            Write-Host "`nAvailable Set IDs:" -ForegroundColor Yellow
+            foreach ($s in $setsObj.Sets) { Write-Host "  $($s.Name)  ->  $($s.Id)" }
         }
-        foreach ($ep in $endpoints) {
-            Write-Host "  Matched endpoint: $($ep.name)  (agentId/legacyId: $($ep.legacyId))" -ForegroundColor DarkGray
-            $agentNameMap[$ep.legacyId] = $ep.name
-        }
-        $agentIds = $endpoints | Select-Object -ExpandProperty legacyId -Unique
     }
-    catch {
-        Write-Warning "Could not call Get Endpoints for set $($set.Id) ($($_.Exception.Message)). Falling back to client-side name filtering on this set (slower, pulls the full date range for the whole set)."
-        $agentIds = @()
-    }
-
-    if ($agentIds.Count -gt 0) {
-        $filterParts = @('agentId IN "' + ($agentIds -join '","') + '"') + $commonFilterParts
-        $useClientSideFilter = $false
-    }
-    else {
-        $filterParts = $commonFilterParts
-        $useClientSideFilter = $true
-    }
-    $filter = $filterParts -join ' AND '
-    Write-Host "  Filter: $filter" -ForegroundColor DarkGray
-
-    $nextCursor = "start"
-    $page       = 0
-
-    do {
-        $page++
-        $uri  = "https://$managerUrl/EPM/API/Sets/$($set.Id)/Events/Search?limit=1000&nextCursor=$nextCursor"
-        $body = @{ filter = $filter } | ConvertTo-Json
-
-        try {
-            $eventsResponse = Invoke-RestMethod -Method Post -Uri $uri -Headers $authHeaders -Body $body
-        }
-        catch {
-            Write-Warning "Event search failed for set $($set.Id), page $page : $($_.Exception.Message)"
-            break
-        }
-
-        $events = $eventsResponse.events
-        Write-Host ("  page {0}: returned {1} of {2} total" -f $page, $eventsResponse.returnedCount, $eventsResponse.filteredCount)
-
-        foreach ($evt in $events) {
-
-            if ($useClientSideFilter -and -not ($evt.lastEventComputerName -and $evt.lastEventComputerName -like "*$ComputerName*")) {
-                continue
-            }
-
-            $resolvedName = $evt.lastEventComputerName
-            if (-not $resolvedName -and $agentNameMap.ContainsKey($evt.agentId)) {
-                $resolvedName = $agentNameMap[$evt.agentId]
-            }
-
-            $allMatches.Add([PSCustomObject]@{
-                SetName                = $set.Name
-                ComputerName           = $resolvedName
-                AgentId                = $evt.agentId
-                UserName               = $evt.userName
-                EventType              = $evt.eventType
-                FileName               = $evt.fileName
-                FileDescription        = $evt.fileDescription
-                Publisher              = $evt.publisher
-                Justification          = $evt.justification
-                JustificationType      = $evt.justificationType   # 1 = JIT, 2 = Other request
-                JitRequestInterval     = $evt.jitRequestInterval  # hours requested
-                PolicyName             = $evt.policyName
-                AccessTargetType       = $evt.accessTargetType
-                AccessTargetName       = $evt.accessTargetName
-                ThreatProtectionAction = $evt.threatProtectionAction
-                FilePath               = $evt.filePath
-                FirstEventDate         = $evt.firstEventDate
-                LastEventDate          = $evt.lastEventDate
-            })
-        }
-
-        $nextCursor = $eventsResponse.nextCursor
-    } while ($nextCursor)
+    catch { }
+    $SetId = Read-Host "`nPaste the Set ID to use for Step 3"
 }
 
 # ---------------------------------------------------------------------------
-# Output
+# step3 - get the jit request events for that set, using the filter support asked for
 # ---------------------------------------------------------------------------
-if ($allMatches.Count -eq 0) {
-    Write-Host "`nNo events found for computer '*$ComputerName*' in range $startIso to $endIso." -ForegroundColor Yellow
+$filter = "eventType EQ `"$EventType`" AND computerName CONTAINS `"$ComputerName`""
+$body3  = @{ filter = $filter } | ConvertTo-Json
+
+if ($Endpoint -eq "Aggregations") {
+    $path3 = "/EPM/API/Sets/$SetId/events/aggregations/search"
 }
 else {
-    $sorted = $allMatches | Sort-Object LastEventDate -Descending
-
-    Write-Host "`nFound $($allMatches.Count) event(s). Breakdown by event type:" -ForegroundColor Green
-    $sorted | Group-Object EventType | Sort-Object Count -Descending |
-        Select-Object @{N='EventType';E={$_.Name}}, Count | Format-Table -AutoSize
-
-    Write-Host "`nMost recent 20 event(s):" -ForegroundColor Green
-    $sorted | Select-Object -First 20 | Format-Table -AutoSize
-
-    if (-not $OutCsv) {
-        $safeComputer = ($ComputerName -replace '[\\/:*?"<>|]', '_')
-        $safeRange    = ($rangeLabel  -replace '[\\/:*?"<>|]', '_')
-        $OutCsv = ".\EPM_AllEvents_${safeComputer}_${safeRange}.csv"
-    }
-    $sorted | Export-Csv -Path $OutCsv -NoTypeInformation
-    Write-Host "`nFull results ($($allMatches.Count) rows) exported to: $OutCsv" -ForegroundColor Green
+    $path3 = "/EPM/API/Sets/$SetId/Events/Search"
 }
+
+Write-Host "`n=== STEP 3: Get JIT/ManualRequest events ($Endpoint) ===" -ForegroundColor Cyan
+Write-Host "Filter sent: $filter" -ForegroundColor DarkGray
+
+$eventsResult = Invoke-EpmRaw -Method Post -Uri "https://$managerUrl$path3" -Headers $authHeaders -Body $body3
+$eventsPretty = Format-Pretty $eventsResult.RawBody
+
+Write-Host "HTTP Status: $($eventsResult.StatusCode)"
+Write-Host $eventsPretty
+Add-Transcript -Title "STEP 3: POST $path3  (HTTP $($eventsResult.StatusCode))  Filter: $filter" -Text $eventsPretty
+
+# ---------------------------------------------------------------------------
+# save everything to one file, ready to paste into the ticket
+# ---------------------------------------------------------------------------
+if (-not $TranscriptPath) {
+    $TranscriptPath = ".\EPM_Support_Case_RawOutput_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+}
+$transcript -join "`r`n" | Out-File -FilePath $TranscriptPath -Encoding UTF8
+Write-Host "`nAll raw output saved to: $TranscriptPath" -ForegroundColor Green
