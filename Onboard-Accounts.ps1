@@ -1,7 +1,6 @@
 <#
 
-.\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892" -StartDate 2026-09-20 -JitOnly
-
+.\Get-EpmJitRequestEvents.ps1 -LoginServer login.epm.cyberark.com -ComputerName "17892" -StartDate 2026-09-20
 .SYNOPSIS
     Queries CyberArk EPM (cloud) for JIT / Manual elevation request events on a specific
     computer, for troubleshooting purposes.
@@ -126,9 +125,22 @@ function Convert-ToIsoDate {
     return $dt.ToString("yyyy-MM-ddTHH:mm:ssZ")
 }
 
+function Get-HostOnly {
+    # EPM sometimes returns ManagerURL WITH a scheme (e.g. "https://na206.epm.cyberark.com")
+    # and sometimes callers pass -LoginServer WITH a scheme too. Normalize to a bare host
+    # so we never accidentally build "https://https://...".
+    param([string]$UrlOrHost)
+    $h = $UrlOrHost.Trim()
+    $h = $h -replace '^https?://', ''
+    $h = $h.TrimEnd('/')
+    return $h
+}
+
 # ---------------------------------------------------------------------------
 # STEP 1 - Login and obtain the token + the real API host (ManagerURL)
 # ---------------------------------------------------------------------------
+$LoginServer = Get-HostOnly $LoginServer
+
 if (-not $Credential) {
     $Credential = Get-Credential -Message "Enter your EPM username and password"
 }
@@ -161,6 +173,7 @@ if (-not $managerUrl) {
     Write-Warning "No ManagerURL returned by the logon call - falling back to $LoginServer for API calls."
     $managerUrl = $LoginServer
 }
+$managerUrl = Get-HostOnly $managerUrl
 
 if ($loginResponse.IsPasswordExpired) {
     Write-Warning "EPM reports this account's password is expired - the token may still work, but log in via the console soon."
@@ -171,7 +184,7 @@ $authHeaders = @{
     "Content-Type"  = "application/json"
 }
 
-Write-Host "Logged on. Using API host: $managerUrl" -ForegroundColor Green
+Write-Host "Logged on. Using API host: https://$managerUrl" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # STEP 2 - Get the list of Sets, resolve which Set to query
