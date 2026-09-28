@@ -54,7 +54,7 @@ if ([string]::IsNullOrWhiteSpace($token)) {
 }
 Write-Host "      Login successful." -ForegroundColor Green
 
-$headers = @{ Authorization = "basic $token"; "Content-Type" = "application/json" }
+$headers = @{ Authorization = "basic $token" }
 
 # ============================================================
 # STEP 2 - Get Set IDs (skipped if -SetId was supplied directly)
@@ -95,7 +95,7 @@ foreach ($set in $setsToSearch) {
 
     try {
         $rawResponse = Invoke-RestMethod -Uri "https://$DataServer/EPM/API/Sets/$($set.Id)/events/aggregations/search" `
-            -Method Post -Headers $headers -Body $searchBody
+            -Method Post -Headers $headers -ContentType "application/json" -Body $searchBody
     }
     catch {
         Write-Host " ERROR: $_" -ForegroundColor Red
